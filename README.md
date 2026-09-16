@@ -65,10 +65,10 @@ from metadata.
 Not yet published to PyPI — install directly from the repo:
 
 ```
-uv tool install git+https://github.com/<owner>/compat-check
+uv tool install git+https://github.com/jahyunlee00299/compat-check
 ```
 
-(or `pipx install git+https://github.com/<owner>/compat-check`, or clone and
+(or `pipx install git+https://github.com/jahyunlee00299/compat-check`, or clone and
 `pip install .` into a venv)
 
 ## Usage
