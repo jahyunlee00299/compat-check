@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test-with-uv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Add uv to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run tests (uv backend)
+        run: |
+          for f in tests/test_*.py; do
+            echo "=== $f ==="
+            python "$f"
+          done
+
+  test-without-uv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run tests (pip fallback only — uv intentionally not installed)
+        run: |
+          for f in tests/test_pip_backend.py tests/test_backend_selection.py; do
+            echo "=== $f ==="
+            python "$f"
+          done
