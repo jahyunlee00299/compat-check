@@ -141,3 +141,43 @@
   - No GitHub API auth used (by design, per prior research — avoids rate limits on the common
     path), so private repos are unreachable; no code path distinguishes "private repo" from
     "repo doesn't exist" — both surface as the same `FetchError` from a 404.
+
+## unit: cli.py — command-line entry point
+
+- **Scope**: core (wiring, not a new capability — this is what makes fetcher/cache/runner
+  reachable by a human instead of only by importing Python)
+- **Inputs**: `sys.argv` — `compat-check <source> [--python X.Y] [--no-cache]`
+- **Outputs**: human-readable report to stdout, error to stderr, process exit code
+  (0 = installable cleanly, 1 = conflicts found, 2 = source could not be resolved at all)
+- **State ownership**: none directly; delegates to cache.py's SQLite file via `cached_probe_all()`
+  unless `--no-cache` is passed, in which case it calls `runner.probe_all()` directly
+- **External effects**: whatever fetcher.py/runner.py/cache.py already do — no new effects
+- **Evidence (Prove)**: `tests/test_cli.py`, 4/4 passing; also run manually as
+  `python -m compat_check.cli <source>` against real sources (see Refute)
+- **Refutation (Refute)** — real end-to-end runs, not just unit-level mocks:
+  - `python -m compat_check.cli requests` → OK, 4 packages resolved, exit 0
+  - `python -m compat_check.cli https://github.com/pallets/flask` → OK, 6 packages, exit 0
+  - `python -m compat_check.cli this-package-definitely-does-not-exist-xyz123` → FetchError
+    surfaced cleanly to stderr, exit 2 (distinct from the resolver-conflict exit 1)
+  - conflicting requirements (`numpy>=2.0` + `numpy<1.20`, injected via `fetch_requirements` mock
+    since neither GitHub nor PyPI naturally exposes this shape) → indented resolver output
+    printed under `[numpy]`, exit 1
+  - repeat call on `requests` → `(cached)` marker shown, wall-clock dropped to ~0.4s (fetcher's
+    network round-trip only; probe itself skipped)
+  - `--no-cache` → report omits the `(cached)` marker even on a repeat call, confirming the flag
+    actually bypasses `cached_probe_all()` rather than just relabeling the output
+  - discovered mid-build: `compat_check/` had no `__init__.py`, so `python -m compat_check.cli`
+    only worked by accident (namespace package + `sys.path` manipulation in prior test files).
+    Added `__init__.py` to make the package importable in the standard way — required for the
+    `-m` invocation the CLI depends on.
+- **Regress**: all 6 test modules (runner/pip-backend/backend-selection/cache/fetcher/cli),
+  20/20 tests total, re-run together after adding cli.py — no new failures.
+- **Connect**: this is the first unit a first-time user actually runs; it exercises the full
+  chain fetcher → cache → runner → report, so its own passing is itself the strongest connectivity
+  evidence for the three units built earlier.
+- **Deferred risk**:
+  - Not yet packaged as an installable console-script entry point (no `pyproject.toml`/`setup.cfg`
+    for the tool itself yet — currently only runnable via `python -m compat_check.cli`, not a bare
+    `compat-check` command). Next unit.
+  - `--python` is accepted but silently ignored by the pip fallback backend (inherited limitation
+    from runner.py, not new here) — not yet surfaced as a warning to the CLI user.
