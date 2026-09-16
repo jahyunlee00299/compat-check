@@ -46,6 +46,22 @@ def test_cache_hit_reported_on_second_call():
     assert "(cached)" in out
 
 
+def test_tree_flag_shows_source_as_root_with_children():
+    rc, out, _ = _run(["https://github.com/pallets/flask", "--no-cache", "--tree"])
+    assert rc == 0
+    assert "https://github.com/pallets/flask" in out
+    assert "markupsafe" in out
+
+
+def test_tree_flag_on_conflict_reports_unavailable_without_crashing():
+    with mock.patch("compat_check.cli.fetch_requirements",
+                     return_value=["numpy>=2.0", "numpy<1.20"]):
+        rc, out, err = _run(["fake-conflict", "--no-cache", "--tree"])
+    assert rc == 1  # the probe_all() failure still drives the exit code
+    assert "PROBLEMS FOUND" in out
+    assert "tree unavailable" in err
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

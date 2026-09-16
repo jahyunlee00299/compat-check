@@ -257,3 +257,60 @@
   - PyPI account/publish step not done — repo is public but not yet on PyPI (matches README's
     stated interim state)
   - No GitHub Actions CI wired yet — deferred, noted in the prior packaging unit too
+
+## unit: tree.py + render.py + cli.py `--tree` — dependency tree visualization
+
+- **Scope**: sub-feature (built on top of the existing fetcher/runner core, not a new axis)
+- **Trigger**: user asked for a dependency tree graph, after confirming (via research) that
+  `uv tree` exists as a real, ready-made source of parent/child edges — no need to build a
+  resolver-internals reader from scratch
+- **Inputs**: `tree.py`: requirements list, python_version. `render.py`: nested dict from
+  `tree.py`, optional `label`. `cli.py`: new `--tree` flag.
+- **Outputs**: `build_tree()` → `{"ok": bool, "roots": [...], "stderr": str}`; `render_tree()` →
+  a colored (TTY) or plain (piped) multi-line ASCII tree string
+- **State ownership**: none persisted; `tree.py` writes a throwaway `pyproject.toml` into a
+  `tempfile.TemporaryDirectory`, same disposable-directory pattern as `runner.py`'s venvs
+- **External effects**: same PyPI-metadata network calls as `probe_all()`, via `uv tree
+  --universal` instead of `uv pip install --dry-run`
+- **Evidence (Prove)**: `tests/test_tree.py` (4/4), `tests/test_render.py` (4/4), 2 new cases in
+  `tests/test_cli.py` (6/6 total for that module) — all passing
+- **Refutation (Refute)** — real signals, not mocks, plus one design bug caught live:
+  - `uv tree` output for `flask` parsed and cross-checked field-by-field against the raw text
+    output captured manually first — 6 direct deps, `jinja2`→`markupsafe` and `werkzeug`→
+    `markupsafe` nested correctly, matching the manually-inspected `uv tree` text exactly
+  - conflicting requirements (`numpy>=2.0` + `numpy<1.20`) → `build_tree()` returns `ok=False`
+    with uv's own error text, not an empty tree silently reported as success
+  - multiple top-level requirements (`requests` + `flask`) → two independent roots, not merged
+    or dropped
+  - uv absent (mocked `shutil.which`) → clean `ok=False` with an explicit "uv is required"
+    message — no pip fallback exists for tree output (pip has no equivalent command), and this
+    is stated in the module docstring and the CLI's `--tree` help text, not left implicit
+  - **design bug found via live run, not self-review**: the first working version rendered
+    `fetch_requirements()`'s output directly as tree roots — for a single-package source like
+    `requests`, this meant `requests` itself never appeared in the tree, only its direct
+    dependencies as separate flat roots (visually indistinguishable from "requests has 4 peer
+    packages" rather than "requests requires 4 packages"). Fixed by adding an optional `label`
+    parameter to `render_tree()` that wraps the roots one level under the source name/URL, so
+    `--tree` on `https://github.com/pallets/flask` now shows `flask` itself as the tree's root
+    with its dependencies nested under it — verified by re-running the CLI and reading the
+    actual indentation, not just checking the function returned without erroring
+  - ANSI color codes verified present when `sys.stdout.isatty()` is mocked `True`, and absent
+    (plain text) when `False` — confirms the auto-disable-when-piped behavior works both ways,
+    not just that color codes exist somewhere in the code
+  - `--tree` combined with a conflicting-requirements run → `probe_all()`'s failure still drives
+    the exit code (1) and its report prints first; the tree section separately reports
+    "(tree unavailable: ...)" to stderr instead of crashing or silently omitting output
+- **Regress**: all 8 test modules (added `test_tree.py`, `test_render.py`; extended
+  `test_cli.py`), 30/30 tests total, re-run together — no new failures in the pre-existing 24.
+- **Connect**: `--tree` is additive to the existing report — `_print_report()` (unchanged) always
+  runs first, `--tree` output is appended only when the flag is passed; existing 6 CLI tests
+  without `--tree` unaffected, confirming no regression to the default (no-flag) path.
+- **Deferred risk**:
+  - No pip-backend equivalent for tree visualization — machines without `uv` lose this one
+    feature specifically (the rest of the tool still works via the pip fallback). Documented in
+    both the module docstring and `--tree`'s `--help` text, not silently degraded.
+  - `uv tree`'s text format (4-space indent, box-drawing prefixes) is unversioned/undocumented
+    upstream — a future uv release changing this format would silently break parsing rather than
+    erroring, since `_LINE_RE`/`_PKG_RE` simply skip lines they can't match. No detection for
+    "uv's tree format changed" as distinct from "no dependencies".
+  - Deep trees (`-d`/`--depth` equivalent) not exposed as a CLI option — always full depth.

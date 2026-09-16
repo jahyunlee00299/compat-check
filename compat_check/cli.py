@@ -10,7 +10,9 @@ import sys
 
 from compat_check.cache import cached_probe_all
 from compat_check.fetcher import FetchError, fetch_requirements
+from compat_check.render import render_tree
 from compat_check.runner import probe_all
+from compat_check.tree import build_tree
 
 
 def _print_report(source: str, requirements: list[str], result: dict) -> None:
@@ -45,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="target Python version (default: 3.11; ignored by the pip fallback)")
     parser.add_argument("--no-cache", action="store_true",
                          help="skip the local failure-history cache, always probe fresh")
+    parser.add_argument("--tree", action="store_true",
+                         help="show the full dependency tree (requires uv; no pip fallback)")
     args = parser.parse_args(argv)
 
     try:
@@ -60,6 +64,15 @@ def main(argv: list[str] | None = None) -> int:
         result = cached_probe_all(requirements, python_version=args.python_version)
 
     _print_report(args.source, requirements, result)
+
+    if args.tree:
+        print()
+        tree_result = build_tree(requirements, python_version=args.python_version)
+        if tree_result["ok"]:
+            print(render_tree(tree_result["roots"], label=args.source))
+        else:
+            print(f"(tree unavailable: {tree_result['stderr'].strip()})", file=sys.stderr)
+
     return 0 if result["ok"] else 1
 
 
