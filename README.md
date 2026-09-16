@@ -74,11 +74,28 @@ uv tool install git+https://github.com/jahyunlee00299/compat-check
 ## Usage
 
 ```
-compat-check <github-url-or-pypi-package-name> [--python 3.11] [--no-cache]
+compat-check <github-url-or-pypi-package-name> [--python 3.11] [--no-cache] [--tree]
 ```
 
 Exit codes: `0` clean, `1` conflicts found, `2` source could not be resolved
 at all (bad URL, nonexistent package).
+
+`--tree` shows the full dependency tree (requires `uv` — no pip-backend
+equivalent exists):
+
+```
+$ compat-check https://github.com/pallets/flask --tree
+...
+https://github.com/pallets/flask
+├── blinker v1.9.0
+├── click v8.5.0
+├── itsdangerous v2.2.0
+├── jinja2 v3.1.6
+│   └── markupsafe v3.0.3
+├── markupsafe v3.0.3
+└── werkzeug v3.1.8
+    └── markupsafe v3.0.3
+```
 
 Results are cached locally (`~/.cache/compat_check/`, 7-day TTL) since a
 dry-run against the same environment and requirements won't change
