@@ -1,5 +1,7 @@
 # compat-check
 
+[![test](https://github.com/jahyunlee00299/compat-check/actions/workflows/test.yml/badge.svg)](https://github.com/jahyunlee00299/compat-check/actions/workflows/test.yml)
+
 Check whether a GitHub repo or PyPI package would install cleanly **in this
 environment** — before you actually install it.
 
