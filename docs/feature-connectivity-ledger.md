@@ -58,3 +58,86 @@
   11/11 pass, no cross-backend regression.
 - **Connect**: both backends satisfy the same `_Backend` interface; `probe_all()`/`probe_once()`
   callers are backend-agnostic and unchanged at the call site.
+
+## unit: cache.py — local failure-history cache (SQLite)
+
+- **Scope**: core
+- **Inputs**: same as `probe_all()` (requirements list, python_version) plus optional `db_path`,
+  `ttl_seconds`
+- **Outputs**: `cached_probe_all()` → same dict shape as `probe_all()` plus `"cache_hit": bool`
+- **State ownership**: `~/.cache/compat_check/history.db` (user cache dir, outside the repo;
+  `.gitignore` already excludes `*.db`). Single table `probe_cache`, keyed on a SHA-256 hash of
+  `{sorted(requirements), python_version, backend}`. `runner.py` stays cache-unaware — `cache.py`
+  wraps it, does not modify it (separation of concerns, as specified).
+- **External effects**: same subprocess/network effects as `probe_all()` on a miss; a hit touches
+  only the local SQLite file, no subprocess, no network.
+- **Evidence (Prove)**: `tests/test_cache.py`, 4/4 passing (`python3 tests/test_cache.py`)
+- **Refutation (Refute)** — real signals, not mocks:
+  - first call on an empty DB → real `probe_all()` executes (`cache_hit=False`); confirmed via a
+    live dry-run against `numpy==0.0.1` (deliberately unsatisfiable, so a stale cache couldn't be
+    mistaken for a correct answer)
+  - second call with identical inputs → cache hit, `probe_all()` does NOT re-run; measured
+    end-to-end (fetcher → cache → runner, `requests` package): miss took 4.62s, hit took 0.04s
+    (~115x), well past the test's 5x threshold
+  - `ttl_seconds=0` → every call is immediately expired, forcing a fresh probe on the second call
+    too (verifies TTL isn't silently ignored)
+  - cache key ignores requirement list ordering (sorted before hashing) and changes when
+    `python_version` changes (two different resolutions must not collide)
+  - environment blocker found while testing, not caused by this unit: this WSL machine lacked
+    `python3-venv`, so the *pre-existing* `_PipBackend.create_venv()` failed with "ensurepip is not
+    available" before cache.py could even be exercised. Fixed by installing the system package
+    (`sudo apt-get install -y python3.12-venv`) — required to prove any probe-based unit on this
+    machine, not a code change.
+- **Regress**: `tests/test_pip_backend.py` (4/4) and `tests/test_backend_selection.py` (2/2)
+  re-run clean after the venv fix. `tests/test_runner.py` now passes 4/5 — the one pre-existing
+  failure (`test_all_ok_reports_resolved_packages`) is a runner.py `resolved_packages` format
+  mismatch against a newer pip version (`pkg-ver` vs the test's expected `pkg==ver`), unrelated to
+  cache.py/fetcher.py and out of this unit's scope per the work order (no scope expansion) —
+  logged here as a deferred risk, not silently fixed.
+- **Connect**: verified end-to-end with fetcher.py — `fetch_requirements("requests")` output fed
+  directly into `cached_probe_all()`, correct on both the miss and the hit.
+- **Deferred risk**:
+  - No cache invalidation on `compat-check` version bump — a resolver change wouldn't invalidate
+    stale entries. Not needed yet (no versioned releases exist).
+  - No cache size cap / eviction policy — unbounded growth over long-term use, acceptable for a
+    local dev tool but not revisited here.
+
+## unit: fetcher.py — repo/package → requirements extraction
+
+- **Scope**: core
+- **Inputs**: `source: str` — a GitHub repo URL or a bare PyPI package name
+- **Outputs**: `fetch_requirements(source) -> list[str]` (requirement specs) or raises `FetchError`
+  — deliberately never returns `[]`, so callers cannot confuse "nothing found" with
+  `probe_all([])`'s "trivially ok" meaning
+- **State ownership**: none, stateless HTTP calls only
+- **External effects**: unauthenticated GET requests to `raw.githubusercontent.com` and
+  `pypi.org/pypi/<name>/json`
+- **Evidence (Prove)**: `tests/test_fetcher.py`, 8/8 passing (`python3 tests/test_fetcher.py`)
+- **Refutation (Refute)** — real network calls against real, well-known repos/packages, no mocks:
+  - `https://github.com/psf/requests` → resolved via `pyproject.toml` on `main`:
+    `['charset_normalizer>=2,<4', 'idna>=2.5,<4', 'urllib3>=1.26,<3', 'certifi>=2023.5.7']`
+  - `https://github.com/pallets/flask` → resolved via `pyproject.toml` on `main`:
+    `['blinker>=1.9.0', 'click>=8.1.3', 'itsdangerous>=2.2.0', 'jinja2>=3.1.2', 'markupsafe>=2.1.1',
+    'werkzeug>=3.1.0']`
+  - bare package name `"requests"` → resolved via PyPI JSON `info.requires_dist`, extras-only
+    markers (`; extra == "..."`) correctly filtered out
+  - nonexistent GitHub repo and nonexistent PyPI package → both correctly raise `FetchError`
+    instead of returning `[]` or silently succeeding
+  - URL parsing handles bare repo URL and `/tree/<branch>` form; rejects non-GitHub URLs (falls
+    through to the PyPI path instead of raising, by design)
+- **Regress**: full suite (`test_runner.py` minus the one pre-existing unrelated failure,
+  `test_pip_backend.py`, `test_backend_selection.py`, `test_cache.py`) re-run together after
+  adding fetcher.py, no new failures introduced.
+- **Connect**: `fetch_requirements()` output is a plain `list[str]` of requirement specs — the
+  exact input type `cached_probe_all()`/`probe_all()` expect; verified end-to-end (see cache.py
+  unit above).
+- **Deferred risk** (explicitly out of scope per work order, not silently dropped):
+  - `setup.py` parsing (AST-based) is NOT implemented — repos with only a `setup.py` and no
+    `pyproject.toml`/`requirements.txt`/`setup.cfg` will raise `FetchError`.
+  - Nested `requirements.txt` includes (`-r other.txt`) and editable installs (`-e .`) are skipped,
+    not followed.
+  - Branch fallback is `main` → `master` only; a repo using a different default branch name (e.g.
+    `develop`) is not covered unless the URL explicitly names it.
+  - No GitHub API auth used (by design, per prior research — avoids rate limits on the common
+    path), so private repos are unreachable; no code path distinguishes "private repo" from
+    "repo doesn't exist" — both surface as the same `FetchError` from a 404.
