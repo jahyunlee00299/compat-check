@@ -1,0 +1,18 @@
+[project]
+name = "compat-check"
+version = "0.1.0"
+description = "Check whether a GitHub repo or PyPI package would install cleanly in this environment, without actually installing it."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+compat-check = "compat_check.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["compat_check"]

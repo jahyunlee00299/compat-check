@@ -181,3 +181,36 @@
     `compat-check` command). Next unit.
   - `--python` is accepted but silently ignored by the pip fallback backend (inherited limitation
     from runner.py, not new here) — not yet surfaced as a warning to the CLI user.
+
+## unit: pyproject.toml + LICENSE + README — GitHub-publish packaging
+
+- **Scope**: core (this is what turns four Python files into an installable, publishable tool)
+- **Inputs**: none (static config/docs)
+- **Outputs**: `pyproject.toml` declaring `[project.scripts] compat-check = "compat_check.cli:main"`;
+  MIT `LICENSE`; `README.md` with a scoped "why this over uv/pip" pitch
+- **State ownership**: n/a
+- **External effects**: n/a until actually pushed to a public GitHub remote (not done yet — repo
+  is still local-only, no `origin` beyond the bundle-transfer artifact used for delegation)
+- **Evidence (Prove)**: `uv tool install --editable .` succeeded, produced a real `compat-check`
+  executable on PATH
+- **Refutation (Refute)** — real install, not just "the TOML is syntactically valid":
+  - `compat-check requests` run as the **installed executable** (no `python -m`, no `sys.path`
+    hacks) → correct output, including a cache hit from the earlier `python -m` runs (proves the
+    installed tool shares the same `~/.cache/compat_check/` as the dev-mode runs, as intended)
+  - `compat-check --help` → argparse help text renders correctly from the packaged entry point
+  - README's two example transcripts (`flask` success, nonexistent-package failure) re-run
+    verbatim against the installed tool and matched — **found and fixed a doc/reality mismatch**:
+    README originally said `uv tool install compat-check` (implying PyPI availability), which is
+    false — nothing is published yet. Corrected to `uv tool install git+https://...` pointing at
+    the repo directly.
+  - `uv tool uninstall compat-check` → clean removal, confirmed `~/.cache/compat_check/history.db`
+    persists independently of the tool install/uninstall (cache is user-scoped, not tied to the
+    package installation)
+- **Regress**: full 20-test suite unaffected (packaging doesn't touch `compat_check/*.py` logic)
+- **Connect**: `[project.scripts]` entry point (`compat_check.cli:main`) is the same `main()`
+  already covered by `tests/test_cli.py` — no new code path introduced by packaging
+- **Deferred risk**:
+  - `<owner>` placeholder in README's install command is not yet a real GitHub username/org —
+    needs the actual publish target before the README is accurate
+  - Not published to PyPI (by design, for now — `git+https://` install is the stated interim path)
+  - No CI (GitHub Actions) wired to run the test suite on push/PR — tests only run locally so far
