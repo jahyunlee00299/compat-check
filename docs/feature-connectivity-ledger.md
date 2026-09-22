@@ -577,3 +577,80 @@
   - `looks_like_github()` is a substring test, so a PyPI package legitimately
     named with `github.com` inside it would be misrouted. No such package
     exists; the trade-off favours the common typo.
+
+## unit: setuppy.py — reading install_requires without executing setup.py (Unit 2)
+
+- **Scope**: core (coverage — repos whose only dependency declaration is code)
+- **Surveyed before building**, 20 well-known repos still shipping a `setup.py`.
+  Only 5 pass `install_requires` to `setup()` at all, and the distribution
+  **contradicted the design's ordering**:
+  - `Name` bound to a module-level list literal — **the most common form**
+    (records, boto3). The design listed the inline literal first and the name
+    binding as a secondary "common shape"; in practice the bare literal barely
+    appears (one case, `supervisor`, and it is an empty list).
+  - not statically knowable: `Call` (celery), `BinOp` (gevent) — 2 of 5, i.e.
+    40% of real cases must fail rather than guess. That ratio is why the
+    no-guess rule matters in practice and not only in principle.
+  - most modern repos have no `setup.py` at all, or one with no
+    `install_requires` — the declarative sources already cover them.
+- **Change**: new `compat_check/setuppy.py` — `ast.parse`, locate the
+  `setup(...)` call (bare or `setuptools.setup`), read `install_requires`,
+  resolving a `Name` through module-level `Assign`/`AnnAssign` bindings and
+  `ast.literal_eval`. `setup.py` is appended to `_CANDIDATE_FILES` **last**,
+  after the three declarative sources.
+- **Divergence from setuptools, deliberate**: `config/expand.py`'s
+  `read_attr()` ends with a broad `except` that imports and executes the module
+  when the static read fails. setuptools may do that — it builds *your own*
+  project. compat-check reads arbitrary third-party repos over the network, so
+  there is **no execution fallback**: a computed value raises. Recorded here so
+  nobody later "fixes" this to match the reference implementation.
+- **Evidence (Prove)**: `tests/test_setuppy.py` 15/15.
+- **Refutation (Refute)** — real files and an actual attack, not fixtures alone:
+  - the five surveyed repos re-run through the parser: records →
+    `['SQLAlchemy>=2.0', 'tablib>=0.11.4', 'openpyxl>2.6.0', 'docopt']`,
+    boto3 → its 3 pinned deps, supervisor → `[]`; celery and gevent both raise
+    with the node type named (`Call`, `BinOp`)
+  - **no-execution proven, not asserted**: a `setup.py` that writes a sentinel
+    file and sets an environment variable is parsed successfully
+    (`install_requires == ['requests']`) while the sentinel does **not** exist
+    and the variable is **not** set afterwards
+  - an empty `install_requires` returns `[]` and does not raise — "declares no
+    dependencies" is an answer, distinct from a failure
+  - a name assigned only inside a function is *not* used (guessing which branch
+    runs is the inference this module refuses)
+  - `setup(**kwargs)`, a non-list value, a non-string entry, a syntax error, a
+    missing `setup()` call and a missing `install_requires` each raise with a
+    distinct message
+- **A connectivity defect this unit exposed in Unit 1** — found by running the
+  real repo, not by review: `kennethreitz/records` has
+  `requirements.txt` = `-e .[pg]` + `pytest`, and no pyproject/setup.cfg. Two
+  bugs compounded:
+  1. `-e .[pg]` kept its extras in the path, so the resolver looked for
+     `.[pg]/pyproject.toml`. Fixed with `_strip_extras()`.
+  2. local-editable resolution only tried `pyproject.toml`/`setup.cfg`, so even
+     with the path fixed the deps were invisible — `setup.py` is now in that
+     list too, and a `SetupPyError` there falls through to the next candidate
+     instead of aborting.
+  Measured: `fetch_requirements("https://github.com/kennethreitz/records")`
+  returned **1** requirement (`pytest`) before, **5** after.
+- **Regress**: 111/111 across 13 modules, 0 failures (was 95/95 across 12).
+  `psf/requests` and `boto/boto3` unchanged, confirming the new last-place
+  candidate does not shadow the declarative sources.
+- **Connect**: `parse_setup_py` is registered in `_PARSERS` like every other
+  parser, so `_fetch_from_github()` needed no special case beyond catching
+  `SetupPyError` — which is *not* fatal on its own (it is the last candidate,
+  and a repo may legitimately compute its requirements), but is remembered so
+  the final `FetchError` explains why rather than saying "nothing found".
+- **Deferred risk**:
+  - Only module-level bindings are followed. `REQS = [...]` inside an
+    `if sys.version_info >= (3, 8):` block is not seen; the call raises rather
+    than picking a branch. Correct but narrower than reality.
+  - `extras_require` is not read — consistent with pyproject's
+    `optional-dependencies` being skipped. Verified this is a real gap, not a
+    theoretical one: records' `extras_require["pg"]` is `['psycopg2-binary']`,
+    which `-e .[pg]` genuinely requires and we do not check. It is no longer
+    *silent*: an editable carrying extras now emits a skip note naming them, so
+    the answer is short by a stated amount rather than quietly.
+  - A `setup.cfg` that exists but declares no `install_requires` returns `[]`
+    and the search moves on to `setup.py`; a `setup.cfg` with a *broken*
+    `install_requires` still raises immediately rather than falling through.

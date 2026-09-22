@@ -71,6 +71,16 @@ def _normalize(base_file: str, target: str) -> str:
     return posixpath.normpath(posixpath.join(base_dir, target)) if base_dir else posixpath.normpath(target)
 
 
+def _strip_extras(target: str) -> str:
+    """``.[pg]`` -> ``.`` — the extras select optional dependency groups, they
+    are not part of the path. Left in place, the caller would look for
+    ``.[pg]/pyproject.toml``.
+    """
+    if target.endswith("]") and "[" in target:
+        return target[: target.rindex("[")]
+    return target
+
+
 def _is_local_editable(target: str) -> bool:
     """True for ``-e .`` / ``-e ./pkg`` — this repo. False for ``-e git+https://...``."""
     return not (
@@ -127,7 +137,18 @@ def resolve_includes(
 
         for target in parsed.editables:
             if _is_local_editable(target):
-                out.local_editables.append(_normalize(path, target))
+                stripped = _strip_extras(target)
+                out.local_editables.append(_normalize(path, stripped))
+                if stripped != target:
+                    # e.g. `-e .[pg]` also pulls extras_require["pg"], which
+                    # this tool does not read (consistent with skipping
+                    # pyproject's optional-dependencies). Say so rather than
+                    # returning a quietly short list.
+                    extras = target[len(stripped):]
+                    out.skipped.append(
+                        f"{path}: -e {target}  (extras {extras} not resolved; "
+                        f"only the base dependencies of {stripped} are checked)"
+                    )
             else:
                 # A different project entirely. Following it would probe the
                 # wrong repo; ignoring it silently would under-report. Say so.

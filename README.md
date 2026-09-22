@@ -152,8 +152,15 @@ answer computed by an older build.
 ## How it works
 
 1. Fetch the requirement list — from `pyproject.toml`, `requirements.txt`,
-   or `setup.cfg` on the GitHub repo, or from PyPI's JSON API for a bare
-   package name. A `requirements.txt` that uses `-r other.txt` has those
+   `setup.cfg` or `setup.py` on the GitHub repo, or from PyPI's JSON API for
+   a bare package name.
+
+   A `setup.py` is read by parsing it, never by running it: `install_requires`
+   is resolved from the syntax tree, including the common
+   `REQUIRES = [...]; setup(install_requires=REQUIRES)` form. When the value is
+   computed at runtime (a function call, a concatenation, a comprehension) the
+   answer is genuinely unknowable without executing a stranger's code, so
+   compat-check says so instead of guessing. A `requirements.txt` that uses `-r other.txt` has those
    files fetched and spliced in, so the list is the complete one: on
    `home-assistant/core` that is 51 requirements rather than the 47 visible
    in the root file. An include that cannot be read is an error, never a
