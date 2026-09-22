@@ -79,9 +79,31 @@ uv tool install git+https://github.com/jahyunlee00299/compat-check
 compat-check <github-url-or-pypi-package-name> [--python 3.11] [--no-cache] [--tree]
 ```
 
+The GitHub source accepts the forms people actually paste:
+
+```
+https://github.com/owner/repo
+https://github.com/owner/repo.git
+https://github.com/owner/repo/tree/some-branch
+https://github.com/owner/repo/blob/some-branch/setup.py
+github.com/owner/repo
+git@github.com:owner/repo.git
+```
+
+Without an explicit branch, the repository's real default branch is looked up
+rather than guessed, so a repo defaulting to something other than `main` costs
+no wasted requests. If the GitHub API is unreachable or its unauthenticated
+budget (60 requests/hour) is exhausted, the lookup degrades to trying `main`
+then `master` — it is an optimization, not a requirement.
+
 Exit codes: `0` clean, `1` conflicts found, `2` source could not be resolved
 at all (bad URL, nonexistent package), `3` invalid parameter (checked before
 any network call, so a typo costs nothing).
+
+A repository that cannot be read is reported as what it is: a missing *or*
+private repo (GitHub returns the same 404 for both, so no tool can tell them
+apart), an exhausted API budget with its reset time, or a GitHub reference
+that could not be parsed — never as a missing PyPI package.
 
 ### `--python` and the pip fallback
 

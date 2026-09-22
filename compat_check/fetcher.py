@@ -5,6 +5,10 @@ raw.githubusercontent.com — unauthenticated, no rate limit (confirmed in
 prior research). setup.py is out of scope for this unit (would need AST
 parsing to be safe; deferred).
 
+The branch is resolved via api.github.com rather than guessed. That API IS
+rate limited (60/hour unauthenticated, measured), so every failure mode of
+the lookup degrades to the old main/master probing instead of erroring.
+
 requirements.txt is parsed by reqline.py and its -r/-c/-e references are
 followed by includes.py, so the returned list is complete or the call raises.
 Measured on home-assistant/core: 47 requirements before following includes,
@@ -22,6 +26,7 @@ from __future__ import annotations
 import configparser
 import json
 import re
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -42,15 +47,88 @@ class GitHubRef:
     branch: str | None  # None = try main, then master
 
 
+# https://github.com/o/r, optionally /tree/<branch> or /blob/<branch>/<path...>.
+# The trailing path of a /blob/ deep link is captured and discarded: the branch
+# is what we need, the file is not.
 _GITHUB_URL_RE = re.compile(
-    r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?"
-    r"(?:/(?:tree|blob)/(?P<branch>[^/]+))?/?$"
+    r"^https?://(?:www\.)?github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?"
+    r"(?:/(?:tree|blob)/(?P<branch>[^/]+)(?:/.*)?)?/?$"
 )
+
+# github.com/o/r with no scheme — a form people paste constantly. Without this
+# the string fell through to the PyPI lookup and failed with
+# "PyPI package not found: github.com/psf/requests".
+_GITHUB_BARE_RE = re.compile(
+    r"^(?:www\.)?github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?"
+    r"(?:/(?:tree|blob)/(?P<branch>[^/]+)(?:/.*)?)?/?$"
+)
+
+# git@github.com:owner/repo.git — the SSH clone form.
+_GITHUB_SSH_RE = re.compile(
+    r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
+
+_GITHUB_FORMS = (_GITHUB_URL_RE, _GITHUB_BARE_RE, _GITHUB_SSH_RE)
 
 _CANDIDATE_FILES = ("pyproject.toml", "requirements.txt", "setup.cfg")
 _BRANCH_FALLBACKS = ("main", "master")
 _USER_AGENT = "compat-check/0.1 (+https://github.com/)"
 _REQUEST_TIMEOUT = 15
+
+
+class RepoLookup:
+    """Outcome of asking the GitHub API about a repo.
+
+    `default_branch` is None when the API could not answer, in which case the
+    caller falls back to probing main/master. The API is an optimization and a
+    diagnostic, never a hard dependency: unauthenticated callers get 60
+    requests per hour (measured), so exhausting it must degrade, not fail.
+    """
+
+    def __init__(self, default_branch: str | None = None, problem: str | None = None):
+        self.default_branch = default_branch
+        self.problem = problem
+
+
+def _lookup_repo(ref: GitHubRef) -> RepoLookup:
+    """Resolve the default branch, and diagnose the failure when there isn't one.
+
+    Replaces guessing main-then-master. The guess wasted a 404 round-trip per
+    candidate file on any repo defaulting to something else (measured on this
+    tool's own repo, which defaults to master), and collapsed several distinct
+    failures into one indistinguishable FetchError.
+    """
+    url = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return RepoLookup(default_branch=data.get("default_branch"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # GitHub deliberately returns 404 for a private repo as well as a
+            # missing one, so it does not leak which private repos exist.
+            # Verified: github/github and a made-up name both return 404.
+            return RepoLookup(problem=(
+                f"GitHub has no public repository {ref.owner}/{ref.repo}. "
+                f"It either does not exist or is private — GitHub returns the "
+                f"same 404 for both, so this tool cannot tell them apart. "
+                f"Private repositories are not supported."
+            ))
+        if e.code == 403 and e.headers.get("X-RateLimit-Remaining") == "0":
+            reset = e.headers.get("X-RateLimit-Reset", "")
+            when = ""
+            if reset.isdigit():
+                when = f" (resets at {time.strftime('%H:%M:%S', time.localtime(int(reset)))})"
+            return RepoLookup(problem=(
+                f"GitHub API rate limit exhausted{when}. compat-check makes "
+                f"unauthenticated requests, which are limited to 60 per hour."
+            ))
+        # Any other status: the API is unusable but the raw file host may not
+        # be, so fall back rather than failing the whole lookup.
+        return RepoLookup()
+    except urllib.error.URLError:
+        return RepoLookup()
 
 
 def _http_get(url: str) -> str | None:
@@ -67,10 +145,33 @@ def _http_get(url: str) -> str | None:
 
 
 def parse_github_url(source: str) -> GitHubRef | None:
-    m = _GITHUB_URL_RE.match(source.strip())
-    if not m:
-        return None
-    return GitHubRef(owner=m.group("owner"), repo=m.group("repo"), branch=m.group("branch"))
+    """Parse any of the GitHub forms people actually paste, else None.
+
+    Returning None routes the source to the PyPI lookup, so a string that is
+    obviously a GitHub reference but unparseable must NOT return None —
+    see looks_like_github().
+    """
+    source = source.strip()
+    for pattern in _GITHUB_FORMS:
+        m = pattern.match(source)
+        if m:
+            groups = m.groupdict()
+            return GitHubRef(
+                owner=groups["owner"],
+                repo=groups["repo"],
+                branch=groups.get("branch"),
+            )
+    return None
+
+
+def looks_like_github(source: str) -> bool:
+    """True for a string that references GitHub but did not parse.
+
+    Without this check such a string fell through to _fetch_from_pypi() and
+    produced "PyPI package not found: github.com/psf/requests" — a message
+    about the wrong service entirely.
+    """
+    return "github.com" in source.lower()
 
 
 def _parse_pyproject_toml(text: str) -> list[str]:
@@ -164,7 +265,22 @@ def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: st
 
 
 def _fetch_from_github(ref: GitHubRef) -> list[str]:
-    branches = [ref.branch] if ref.branch else list(_BRANCH_FALLBACKS)
+    if ref.branch:
+        branches = [ref.branch]
+        lookup = RepoLookup()
+    else:
+        lookup = _lookup_repo(ref)
+        if lookup.problem:
+            # A diagnosed failure is final: probing raw.githubusercontent.com
+            # would only produce 404s and a vaguer message.
+            raise FetchError(lookup.problem)
+        if lookup.default_branch:
+            branches = [lookup.default_branch]
+        else:
+            # API unreachable or unhelpful — degrade to the old guess rather
+            # than failing on what is only an optimization.
+            branches = list(_BRANCH_FALLBACKS)
+
     tried = []
     for branch in branches:
         for filename in _CANDIDATE_FILES:
@@ -188,9 +304,13 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
             if reqs:
                 return reqs
             # file exists but declares no dependencies — keep searching other files/branches
+    branch_note = (
+        f" on branch {branches[0]}" if len(branches) == 1
+        else f" on any of {', '.join(branches)}"
+    )
     raise FetchError(
         f"no pyproject.toml/requirements.txt/setup.cfg with dependencies found for "
-        f"{ref.owner}/{ref.repo} (tried: {', '.join(tried)})"
+        f"{ref.owner}/{ref.repo}{branch_note} (tried: {', '.join(tried)})"
     )
 
 
@@ -219,4 +339,14 @@ def fetch_requirements(source: str) -> list[str]:
     ref = parse_github_url(source)
     if ref is not None:
         return _fetch_from_github(ref)
+    if looks_like_github(source):
+        # Do not fall through to PyPI: the user clearly meant GitHub, and a
+        # "PyPI package not found" message would send them looking in the
+        # wrong place entirely.
+        raise FetchError(
+            f"{source!r} looks like a GitHub reference but could not be parsed. "
+            f"Expected forms: https://github.com/<owner>/<repo>, "
+            f"github.com/<owner>/<repo>, git@github.com:<owner>/<repo>.git, "
+            f"optionally with /tree/<branch>."
+        )
     return _fetch_from_pypi(source)
