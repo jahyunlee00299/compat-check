@@ -34,7 +34,7 @@ jobs:
           python-version: "3.11"
       - name: Run tests (pip fallback only — uv intentionally not installed)
         run: |
-          for f in tests/test_pip_backend.py tests/test_backend_selection.py tests/test_params.py tests/test_cache.py tests/test_reqline.py tests/test_includes.py tests/test_github_ref.py; do
+          for f in tests/test_pip_backend.py tests/test_backend_selection.py tests/test_params.py tests/test_cache.py tests/test_reqline.py tests/test_includes.py tests/test_github_ref.py tests/test_setuppy.py; do
             echo "=== $f ==="
             python "$f"
           done

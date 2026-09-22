@@ -1,9 +1,10 @@
 """Resolve a GitHub repo URL or a PyPI package name into requirement specs.
 
-GitHub path tries pyproject.toml, then requirements.txt, then setup.cfg, on
-raw.githubusercontent.com — unauthenticated, no rate limit (confirmed in
-prior research). setup.py is out of scope for this unit (would need AST
-parsing to be safe; deferred).
+GitHub path tries pyproject.toml, then requirements.txt, then setup.cfg,
+then setup.py, on raw.githubusercontent.com — unauthenticated, no rate limit
+(confirmed in prior research). setup.py is read by AST (setuppy.py) and is
+tried last, because the other three are declarative and always more reliable
+than reading code without running it.
 
 The branch is resolved via api.github.com rather than guessed. That API IS
 rate limited (60/hour unauthenticated, measured), so every failure mode of
@@ -34,6 +35,7 @@ from dataclasses import dataclass
 
 from compat_check.includes import IncludeError, resolve_includes
 from compat_check.reqline import parse_lines
+from compat_check.setuppy import SetupPyError, parse_setup_py
 
 
 class FetchError(Exception):
@@ -70,7 +72,10 @@ _GITHUB_SSH_RE = re.compile(
 
 _GITHUB_FORMS = (_GITHUB_URL_RE, _GITHUB_BARE_RE, _GITHUB_SSH_RE)
 
-_CANDIDATE_FILES = ("pyproject.toml", "requirements.txt", "setup.cfg")
+# setup.py is last on purpose: pyproject/requirements/setup.cfg are
+# declarative, while setup.py is read by AST and may legitimately be
+# unreadable (a computed install_requires).
+_CANDIDATE_FILES = ("pyproject.toml", "requirements.txt", "setup.cfg", "setup.py")
 _BRANCH_FALLBACKS = ("main", "master")
 _USER_AGENT = "compat-check/0.1 (+https://github.com/)"
 _REQUEST_TIMEOUT = 15
@@ -214,6 +219,7 @@ _PARSERS = {
     "pyproject.toml": _parse_pyproject_toml,
     "requirements.txt": _parse_requirements_txt,
     "setup.cfg": _parse_setup_cfg,
+    "setup.py": parse_setup_py,
 }
 
 
@@ -242,7 +248,11 @@ def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: st
     # dependencies live in that directory's own pyproject/setup.cfg.
     for target in resolved.local_editables:
         prefix = "" if target in (".", "") else f"{target.rstrip('/')}/"
-        for candidate in ("pyproject.toml", "setup.cfg"):
+        # setup.py included: records/records is exactly this shape — a
+        # requirements.txt of "-e .[pg]" plus a setup.py and nothing else.
+        # Without it the real dependencies were invisible and only the one
+        # sibling line survived.
+        for candidate in ("pyproject.toml", "setup.cfg", "setup.py"):
             sub = _http_get(
                 f"https://raw.githubusercontent.com/{ref.owner}/{ref.repo}/"
                 f"{branch}/{prefix}{candidate}"
@@ -251,6 +261,10 @@ def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: st
                 continue
             try:
                 resolved.requirements.extend(_PARSERS[candidate](sub))
+            except SetupPyError:
+                # This candidate exists but is not statically readable; a
+                # later one might be. Only if none works do we lose the deps.
+                continue
             except Exception as e:
                 raise FetchError(f"failed to parse {prefix}{candidate} for -e {target}: {e}") from e
             break
@@ -282,6 +296,7 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
             branches = list(_BRANCH_FALLBACKS)
 
     tried = []
+    setup_py_problem: str | None = None
     for branch in branches:
         for filename in _CANDIDATE_FILES:
             url = f"https://raw.githubusercontent.com/{ref.owner}/{ref.repo}/{branch}/{filename}"
@@ -294,6 +309,12 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
                     reqs = _fetch_requirements_txt(ref, branch, filename, text)
                 else:
                     reqs = _PARSERS[filename](text)
+            except SetupPyError as e:
+                # Not fatal on its own: this is the last candidate, and the
+                # repo may simply compute its requirements. Remember why, so
+                # the final error explains it instead of saying "not found".
+                setup_py_problem = str(e)
+                continue
             except IncludeError as e:
                 # An unresolvable include means the requirement set is unknown.
                 # Failing loudly is the whole point — do not fall through to
@@ -308,9 +329,15 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
         f" on branch {branches[0]}" if len(branches) == 1
         else f" on any of {', '.join(branches)}"
     )
+    if setup_py_problem:
+        raise FetchError(
+            f"{ref.owner}/{ref.repo}{branch_note}: the only dependency "
+            f"declaration is a setup.py that cannot be read statically — "
+            f"{setup_py_problem}"
+        )
     raise FetchError(
-        f"no pyproject.toml/requirements.txt/setup.cfg with dependencies found for "
-        f"{ref.owner}/{ref.repo}{branch_note} (tried: {', '.join(tried)})"
+        f"no pyproject.toml/requirements.txt/setup.cfg/setup.py with dependencies "
+        f"found for {ref.owner}/{ref.repo}{branch_note} (tried: {', '.join(tried)})"
     )
 
 
