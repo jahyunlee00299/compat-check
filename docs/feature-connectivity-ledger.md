@@ -510,3 +510,70 @@
     is not followed a second level.
   - The 32-file cap is global, not per-branch; a wide-but-shallow tree could trip
     it before the depth cap does.
+
+## unit: fetcher Unit 3 — default-branch detection, URL forms, error diagnosis
+
+- **Scope**: core (diagnosis and round-trip reduction; no new capability)
+- **Trigger**: v0.3 design Unit 3, after Units 0/1 shipped in 0.3.0.
+- **Measured before building** (`api.github.com`, unauthenticated):
+  - `jahyunlee00299/compat-check` → 200, `default_branch=master`;
+    `psf/requests` → 200, `main`. Detection works.
+  - a nonexistent repo and `github/github` (real, private to us) **both return
+    404** — GitHub does this deliberately so private repos do not leak. The
+    design's "say it is one of the two, do not claim which" is therefore the
+    only honest wording, confirmed rather than assumed.
+  - **rate limit is 60 requests/hour unauthenticated** — not in the design.
+    This makes the fallback mandatory rather than merely nice, and is why a
+    403 is only diagnosed as rate limiting when `X-RateLimit-Remaining: 0`.
+- **Change**:
+  - `_lookup_repo()` → `RepoLookup(default_branch, problem)`. One API call
+    replaces probing `main` then `master` across every candidate file.
+  - 404 → a message naming both possibilities and stating private repos are
+    unsupported. 403 with the budget exhausted → rate-limit message with the
+    reset time. Any other status, or a network error → `RepoLookup()` with
+    neither field set, so the caller degrades to the old `main`/`master` guess.
+  - `parse_github_url()` accepts three forms it previously rejected:
+    scheme-less `github.com/o/r`, SSH `git@github.com:o/r.git`, and
+    `/blob/<branch>/<path>` deep links (branch used, path discarded). `www.`
+    prefix handled.
+  - `looks_like_github()` + a check in `fetch_requirements()`: a string
+    containing `github.com` that did not parse now raises a GitHub-specific
+    error listing the accepted forms, instead of falling through to the PyPI
+    lookup and reporting `PyPI package not found: github.com/psf/requests`.
+- **Evidence (Prove)**: `tests/test_github_ref.py` 13/13. Network paths are
+  mocked so the suite does not spend the measured 60/hour budget.
+- **Refutation (Refute)**:
+  - **the round-trip saving, measured** by counting `_http_get` calls: on this
+    repo (defaults to `master`) a fetch now makes **3** raw requests, all against
+    the real branch, where the old code made 3 futile `main/*` 404s first — a
+    6→3 halving. On flask (`main`) the first candidate file hits immediately: 1
+    request.
+  - a diagnosed 404 does **not** fall through to raw probing
+    (`_http_get.call_count == 0`), so the specific message is not replaced by a
+    vaguer "no pyproject.toml found".
+  - API unreachable (`URLError`) still resolves through `main`→`master`, proving
+    the API is an optimization and not a new hard dependency.
+  - an explicit `/tree/<branch>` skips the lookup entirely
+    (`_lookup_repo.call_count == 0`) — no budget spent when the user already said.
+  - a 403 that is *not* rate limiting (`X-RateLimit-Remaining: 42`) falls back
+    rather than emitting a false rate-limit diagnosis.
+  - `fetch_requirements("github.com/only-one-segment")` raises a GitHub error
+    with `_fetch_from_pypi.call_count == 0`.
+  - all 11 pasted URL forms parse to the same owner/repo, with the branch
+    extracted only where one is present.
+- **Regress**: 95/95 across 12 modules, 0 failures (was 82/82 across 11).
+- **Connect**: `_fetch_from_github()` is the only caller of `_lookup_repo()`;
+  `fetch_requirements()` is the only caller of `looks_like_github()`. Both live
+  behind the unchanged public signature.
+- **Deferred risk**:
+  - **The CLI spends one API request per run even on a cache hit.** Measured:
+    `cached_probe_all()` returns `cache_hit=True` on the second run, but
+    `cli.main()` calls `fetch_requirements()` *before* consulting the cache, so
+    the branch lookup happens regardless. At 60/hour this is tolerable for
+    interactive use and would matter in a loop. Fixing it means caching the
+    fetch itself, which is a separate design (provenance, TTL, invalidation).
+  - The branch lookup result is not cached within a process either; two
+    `fetch_requirements()` calls for the same repo make two API calls.
+  - `looks_like_github()` is a substring test, so a PyPI package legitimately
+    named with `github.com` inside it would be misrouted. No such package
+    exists; the trade-off favours the common typo.
