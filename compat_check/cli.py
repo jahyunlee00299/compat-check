@@ -10,6 +10,7 @@ import sys
 
 from compat_check.cache import cached_probe_all
 from compat_check.fetcher import FetchError, fetch_requirements
+from compat_check.params import ParamError, validate_python_version
 from compat_check.render import render_tree
 from compat_check.runner import probe_all
 from compat_check.tree import build_tree
@@ -19,6 +20,18 @@ def _print_report(source: str, requirements: list[str], result: dict) -> None:
     cache_note = " (cached)" if result.get("cache_hit") else ""
     print(f"compat-check: {source}{cache_note}")
     print(f"backend: {result['backend']}")
+
+    # A parameter the backend could not honour is stated here rather than
+    # silently applied — the report must describe the probe that actually ran.
+    params = result.get("params")
+    if params is not None:
+        if params.python_was_ignored:
+            print(f"python: {params.effective_python} "
+                  f"(requested {params.requested_python} — NOT honoured)")
+        else:
+            print(f"python: {params.effective_python}")
+        for warning in params.warnings:
+            print(f"  warning: {warning}", file=sys.stderr)
     print(f"requirements checked: {', '.join(requirements)}")
     print()
 
@@ -44,12 +57,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("source", help="GitHub repo URL or PyPI package name")
     parser.add_argument("--python", default="3.11", dest="python_version",
-                         help="target Python version (default: 3.11; ignored by the pip fallback)")
+                         help="target Python version (default: 3.11). The pip fallback "
+                              "backend cannot honour this and will say so explicitly.")
     parser.add_argument("--no-cache", action="store_true",
                          help="skip the local failure-history cache, always probe fresh")
     parser.add_argument("--tree", action="store_true",
                          help="show the full dependency tree (requires uv; no pip fallback)")
     args = parser.parse_args(argv)
+
+    try:
+        # Validate before the network call: a typo in --python should not cost
+        # a GitHub round-trip before it is reported.
+        validate_python_version(args.python_version)
+    except ParamError as e:
+        print(f"compat-check: {e}", file=sys.stderr)
+        return 3
 
     try:
         requirements = fetch_requirements(args.source)

@@ -80,7 +80,28 @@ compat-check <github-url-or-pypi-package-name> [--python 3.11] [--no-cache] [--t
 ```
 
 Exit codes: `0` clean, `1` conflicts found, `2` source could not be resolved
-at all (bad URL, nonexistent package).
+at all (bad URL, nonexistent package), `3` invalid parameter (checked before
+any network call, so a typo costs nothing).
+
+### `--python` and the pip fallback
+
+`--python` is honoured only by the `uv` backend. The pip fallback builds its
+venv with the standard-library `venv` module, which can only clone the
+interpreter compat-check is itself running on — it cannot fetch another
+version. Rather than accept the flag and quietly ignore it, the report states
+the version actually probed:
+
+```
+$ compat-check requests --python 3.9     # on a machine without uv
+compat-check: requests
+backend: pip
+python: 3.13 (requested 3.9 — NOT honoured)
+```
+
+with the reason on stderr. The cache is keyed on the version that was really
+used, so two requests that run the identical probe share one cache entry
+instead of being stored under two versions, only one of which was measured.
+Install `uv` to target other Python versions for real.
 
 `--tree` shows the full dependency tree (requires `uv` — no pip-backend
 equivalent exists):
@@ -101,7 +122,10 @@ https://github.com/pallets/flask
 
 Results are cached locally (`~/.cache/compat_check/`, 7-day TTL) since a
 dry-run against the same environment and requirements won't change
-minute-to-minute. Use `--no-cache` to force a fresh probe.
+minute-to-minute. Use `--no-cache` to force a fresh probe. The cache holds the
+500 most recent entries (oldest evicted first) and is invalidated automatically
+when compat-check's own version changes, so a resolver change never serves an
+answer computed by an older build.
 
 ## How it works
 

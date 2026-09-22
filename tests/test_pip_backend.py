@@ -14,7 +14,21 @@ _PIP = _PipBackend()
 def test_pip_all_ok():
     r = probe_once(["requests>=2.0"], backend=_PIP)
     assert r.ok is True
-    assert any(p.startswith("requests-") for p in r.resolved_packages), r.resolved_packages
+    # Both backends emit "name==version"; pip's native "name-version" form is
+    # normalized in runner._normalize_resolved so callers see one contract.
+    assert any(p.startswith("requests==") for p in r.resolved_packages), r.resolved_packages
+
+
+def test_pip_resolved_format_matches_uv_contract():
+    """The two backends must not disagree about how a resolved package looks."""
+    r = probe_once(["requests>=2.0"], backend=_PIP)
+    assert r.resolved_packages
+    for pkg in r.resolved_packages:
+        assert "==" in pkg, f"pip backend leaked a non-normalized token: {pkg}"
+        assert not pkg.endswith("=="), pkg
+    # Hyphenated names must survive normalization intact.
+    names = [p.split("==")[0] for p in r.resolved_packages]
+    assert "charset-normalizer" in names or "charset_normalizer" in names, names
 
 
 def test_pip_empty_requirements():

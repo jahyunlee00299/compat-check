@@ -18,6 +18,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from compat_check.params import ResolvedParams, resolve_params
+
 
 @dataclass
 class ProbeResult:
@@ -48,6 +50,25 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     # Windows' cp949 console encoding can't decode uv's box-drawing error
     # glyphs (×, ╰, ▶) — found via a live crash, not by inspection.
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+_RESOLVED_TOKEN_RE = re.compile(r"^(?P<name>.+)-(?P<version>\d[^-]*)$")
+
+
+def _normalize_resolved(token: str) -> str:
+    """Render one resolved package as "name==version" whatever the backend.
+
+    pip reports "requests-2.34.2", uv reports "requests==2.34.2". Splitting on
+    the LAST hyphen that starts a digit keeps hyphenated names intact
+    ("charset-normalizer-3.5.1" -> "charset-normalizer==3.5.1"). A token that
+    matches neither shape is passed through unchanged rather than mangled.
+    """
+    if "==" in token:
+        return token
+    m = _RESOLVED_TOKEN_RE.match(token)
+    if m is None:
+        return token
+    return f"{m.group('name')}=={m.group('version')}"
 
 
 class _UvBackend(_Backend):
@@ -118,10 +139,17 @@ class _PipBackend(_Backend):
         ok = proc.returncode == 0
         resolved = []
         if ok:
-            # pip writes "Would install pkg1-ver pkg2-ver ..." to stdout.
+            # pip writes "Would install pkg1-ver pkg2-ver ..." to stdout, using a
+            # single hyphen where uv writes "pkg==ver". Normalized here so callers
+            # (and the cached rows they compare against) see one format regardless
+            # of which backend ran — the mismatch was real: tests asserting
+            # "requests==" passed under uv and failed under pip.
             for line in proc.stdout.splitlines():
                 if line.startswith("Would install "):
-                    resolved = line[len("Would install "):].split()
+                    resolved = [
+                        _normalize_resolved(tok)
+                        for tok in line[len("Would install "):].split()
+                    ]
         # `python -m pip` routes ERROR: lines to stderr; a standalone `pip`
         # executable was observed routing them to stdout instead — check both.
         failing = None if ok else (
@@ -168,10 +196,17 @@ def probe_once(requirements: list[str], python_version: str = "3.11",
 def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds: int = 20) -> dict:
     """Repeatedly probe, dropping each failing package, to surface every failure.
 
-    Returns {"ok": bool, "backend": str, "failures": [{"package": str, "stderr": str}],
-    "resolved": [str]}.
+    Returns {"ok": bool, "backend": str, "params": ResolvedParams,
+    "failures": [{"package": str, "stderr": str}], "resolved": [str]}.
+
+    The python version is resolved through params.resolve_params() before any
+    venv is built, so an invalid value fails here rather than inside uv, and a
+    value the pip backend cannot honour is reported as ignored instead of being
+    passed along as if it applied.
     """
     backend = _select_backend()
+    params = resolve_params(python_version, backend.name)
+    python_version = params.effective_python
     remaining = list(requirements)
     failures: list[dict] = []
     seen_failing: set[str] = set()
@@ -179,7 +214,7 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
     for _ in range(max_rounds):
         result = probe_once(remaining, python_version, backend=backend)
         if result.ok:
-            return {"ok": not failures, "backend": backend.name,
+            return {"ok": not failures, "backend": backend.name, "params": params,
                      "failures": failures, "resolved": result.resolved_packages}
 
         combined_output = "\n".join(s for s in (result.stderr, result.stdout) if s)
@@ -193,5 +228,5 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
         remaining = [r for r in remaining if not r.lower().startswith(pkg.lower())]
 
     final = probe_once(remaining, python_version, backend=backend)
-    return {"ok": False, "backend": backend.name,
+    return {"ok": False, "backend": backend.name, "params": params,
              "failures": failures, "resolved": final.resolved_packages}

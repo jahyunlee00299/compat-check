@@ -314,3 +314,84 @@
     erroring, since `_LINE_RE`/`_PKG_RE` simply skip lines they can't match. No detection for
     "uv's tree format changed" as distinct from "no dependencies".
   - Deep trees (`-d`/`--depth` equivalent) not exposed as a CLI option — always full depth.
+
+## unit: params.py — parameter SSOT (`--python` guard, cache identity, version invalidation)
+
+- **Scope**: cross-cutting (this unit does not add a capability; it removes a class of silent
+  wrongness that spanned cli.py, runner.py and cache.py)
+- **Trigger**: user asked to close the remaining "SSOT param guard" items. Reading the code
+  surfaced a defect worse than the logged deferred risk: `--python` was not merely *ignored* by
+  the pip backend, it was ignored **and still hashed into the cache key**.
+- **The defect, precisely**: `_PipBackend.create_venv()` cannot target another interpreter (stdlib
+  `venv` clones the running one; only `uv venv --python X.Y` can fetch a different version), but
+  `cache.make_cache_key()` hashed `python_version` regardless. So on a pip-backend machine
+  `--python 3.9` and `--python 3.13` ran a **byte-identical probe** yet landed in **two different
+  cache rows**, each labelled with a version it was never measured against. A later `--python 3.9`
+  hit would serve, as a 3.9 answer, a result actually measured on 3.13. Two prior ledger entries
+  recorded the "silently ignored" half of this; neither noticed the cache-key half.
+- **Change**:
+  - new `compat_check/params.py`: `validate_python_version()` (rejects `3.111`, `2.7`, `4.0`,
+    non-numeric, empty), `resolve_params(python_version, backend) -> ResolvedParams`
+    (`requested_python` vs `effective_python` + `warnings`), `cache_identity()` (the single
+    definition of what determines a probe's outcome)
+  - `cache.make_cache_key()` now takes `ResolvedParams` and hashes `effective_python`, never the
+    requested value — two requests that run the same probe share one row
+  - cache identity includes `compat_check_version`, so a resolver/logic change invalidates stale
+    rows instead of reusing them (closes a logged deferred risk)
+  - `cache._evict_if_needed()` + `DEFAULT_MAX_ROWS=500`, oldest-first (closes the unbounded-growth
+    deferred risk)
+  - `runner.probe_all()` resolves params once and returns them in its result dict
+  - `runner._normalize_resolved()`: pip's `"requests-2.34.2"` → `"requests==2.34.2"`, matching uv
+  - `cli.py`: prints the version actually probed (`python: 3.13 (requested 3.9 — NOT honoured)`),
+    routes the explanation to stderr, and exits **3** on an invalid parameter — distinct from
+    2 (unresolvable source) and 1 (conflict)
+  - `compat_check.__version__` is now the single version source; `pyproject.toml` reads it via
+    setuptools dynamic version (no static `version =` key remains to drift)
+- **Evidence (Prove)**: `tests/test_params.py` 10/10, `tests/test_cache.py` 6/6,
+  `tests/test_cli.py` 9/9. Full suite **53/53 across 9 modules, 0 failures** (was 30/30 across 8,
+  with 1 module failing under the pip backend).
+- **Refutation (Refute)** — external signals, including a deliberate control:
+  - **the fix, measured**: on the pip backend, `cache_identity` for `--python 3.9` and
+    `--python 3.13` are now byte-equal (`True`) — the two rows collapse into one
+  - **control, to prove the fix is not just "drop the field"**: on the **uv** backend the same two
+    versions still produce **different** keys (`True`), because uv genuinely honours the request.
+    A naive fix (removing `python_version` from the key) would have passed the first check and
+    failed this one.
+  - **the warning reaches the user**: CLI forced onto the pip backend (`shutil.which("uv")` → None)
+    and run end-to-end — stdout carries `python: 3.13 (requested 3.9 — NOT honoured)`, stderr
+    carries the full explanation naming both versions and the `uv` remedy. Verified by capturing
+    both streams, not by reading the source.
+  - **the guard runs before the network**: `test_invalid_python_version_exits_3_without_network`
+    asserts `fetch_requirements.call_count == 0` on `--python 3.111` — a typo costs no GitHub
+    round-trip. Confirmed live: exit 3, no request.
+  - **version invalidation**: mutating `params.__version__` changes the cache key (`True`);
+    `python -m build` produces `compat_check-0.2.0-py3-none-any.whl`, proving pyproject's dynamic
+    version reads the same attribute the cache key does — one source, not two that agree by luck.
+  - **backend format contract**: `_normalize_resolved` verified against hyphenated names —
+    `charset-normalizer-3.5.1` → `charset-normalizer==3.5.1` (splits on the last hyphen that
+    starts a digit, so the name survives); unrecognized tokens pass through unmangled rather than
+    being truncated.
+  - **eviction**: 10 synthetic rows, `max_rows=4` → exactly 6 removed and precisely the 4 newest
+    (`key6..key9`) retained, verified by reading back the surviving keys; a second call at the same
+    cap is a no-op (0 removed).
+- **Regress**: all 8 pre-existing modules re-run. One pre-existing failure was **resolved, not
+  suppressed**: `test_pip_backend.py` asserted `"requests-"` while `test_runner.py` asserted
+  `"requests=="` — the ledger had recorded this as a "newer pip version format mismatch", but it
+  was actually the two backends disagreeing about their own output contract. Normalizing at the
+  backend boundary makes both assertions describe one format; a new test
+  (`test_pip_resolved_format_matches_uv_contract`) pins it so the two cannot drift apart again.
+- **Connect**: `params.py` has no dependency on cli/cache/runner — the arrows point inward. All
+  three call into it, so there is exactly one place that decides what `--python` means. CI's
+  pip-only job now runs `test_params.py` and `test_cache.py` as well, so the collapse behaviour is
+  exercised on the backend where it actually matters (the uv job runs the whole suite already).
+- **Deferred risk**:
+  - `MAX_MINOR = 20` is an arbitrary upper bound that will need raising around Python 3.21; it
+    rejects typos (`3.111`) at the cost of a future edit. Chosen deliberately over no bound.
+  - Eviction is oldest-first by `checked_at`, not least-recently-*used* — a frequently-read old
+    entry is still evicted before a write-once new one. Fine for a local dev cache; noted rather
+    than modelled.
+  - The pip backend still cannot target another Python version. This unit makes that **visible and
+    correctly cached**; it does not remove the limitation (only installing `uv` does).
+  - `ResolvedParams` now travels inside `probe_all()`'s result dict, so the dict is no longer
+    purely JSON-serializable. Only the cached fields are persisted (the dataclass is re-derived on
+    a hit, never stored), but a caller who blindly `json.dumps()` the whole result would now fail.

@@ -13,10 +13,15 @@ import sqlite3
 import time
 from pathlib import Path
 
+from compat_check.params import ResolvedParams, cache_identity, resolve_params
 from compat_check.runner import _select_backend, probe_all
 
 DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days — see docs/feature-connectivity-ledger.md
 DEFAULT_DB_PATH = Path.home() / ".cache" / "compat_check" / "history.db"
+
+# Unbounded growth was a logged deferred risk. Rows are cheap, but a
+# long-lived dev machine probing many repos would keep every one forever.
+DEFAULT_MAX_ROWS = 500
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS probe_cache (
@@ -37,12 +42,30 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def make_cache_key(requirements: list[str], python_version: str, backend: str) -> str:
-    normalized = json.dumps(
-        {"requirements": sorted(requirements), "python_version": python_version, "backend": backend},
-        sort_keys=True,
-    )
+def make_cache_key(requirements: list[str], params: ResolvedParams) -> str:
+    """Hash the facts that actually determined the probe's outcome.
+
+    Built from params.cache_identity() rather than the raw CLI values, so a
+    version the backend ignored can never split one real result across two
+    rows — and a compat-check version bump invalidates rather than reuses.
+    """
+    normalized = json.dumps(cache_identity(requirements, params), sort_keys=True)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _evict_if_needed(conn: sqlite3.Connection, max_rows: int) -> int:
+    """Drop the oldest rows past `max_rows`. Returns how many were removed."""
+    (count,) = conn.execute("SELECT COUNT(*) FROM probe_cache").fetchone()
+    if count <= max_rows:
+        return 0
+    surplus = count - max_rows
+    conn.execute(
+        "DELETE FROM probe_cache WHERE cache_key IN ("
+        "  SELECT cache_key FROM probe_cache ORDER BY checked_at ASC LIMIT ?"
+        ")",
+        (surplus,),
+    )
+    return surplus
 
 
 def cached_probe_all(
@@ -51,6 +74,7 @@ def cached_probe_all(
     max_rounds: int = 20,
     db_path: Path | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    max_rows: int = DEFAULT_MAX_ROWS,
 ) -> dict:
     """probe_all(), but returns a cached result when one exists and hasn't expired.
 
@@ -59,7 +83,10 @@ def cached_probe_all(
     """
     db_path = db_path or DEFAULT_DB_PATH
     backend_name = _select_backend().name
-    cache_key = make_cache_key(requirements, python_version, backend_name)
+    # Resolve before touching the DB: an invalid --python must fail the same
+    # way whether or not a cached row happens to exist for it.
+    params = resolve_params(python_version, backend_name)
+    cache_key = make_cache_key(requirements, params)
 
     conn = _connect(db_path)
     try:
@@ -77,6 +104,7 @@ def cached_probe_all(
                     "backend": backend,
                     "failures": json.loads(failures_json),
                     "resolved": json.loads(resolved_json),
+                    "params": params,
                     "cache_hit": True,
                 }
 
@@ -94,6 +122,7 @@ def cached_probe_all(
                 time.time(),
             ),
         )
+        _evict_if_needed(conn, max_rows)
         conn.commit()
         return {**result, "cache_hit": False}
     finally:
