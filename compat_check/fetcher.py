@@ -5,6 +5,11 @@ raw.githubusercontent.com — unauthenticated, no rate limit (confirmed in
 prior research). setup.py is out of scope for this unit (would need AST
 parsing to be safe; deferred).
 
+requirements.txt is parsed by reqline.py and its -r/-c/-e references are
+followed by includes.py, so the returned list is complete or the call raises.
+Measured on home-assistant/core: 47 requirements before following includes,
+181 after — the earlier code silently reported the 47 as the whole set.
+
 PyPI path reads info.requires_dist from the package's JSON API.
 
 fetch_requirements() distinguishes "found nothing" from "found an empty
@@ -21,6 +26,9 @@ import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+from compat_check.includes import IncludeError, resolve_includes
+from compat_check.reqline import parse_lines
 
 
 class FetchError(Exception):
@@ -74,15 +82,22 @@ def _parse_pyproject_toml(text: str) -> list[str]:
 
 
 def _parse_requirements_txt(text: str) -> list[str]:
-    reqs = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith(("-r ", "-e ", "--")):
-            continue  # nested includes / editable installs / pip flags out of scope
-        reqs.append(line)
-    return reqs
+    """Parse a standalone requirements.txt with NO include following.
+
+    Retained for callers that have only the text and no way to fetch siblings.
+    A file using -r/-c/-e cannot be answered this way — resolve_includes()
+    handles those, and _fetch_from_github() uses it. Raises FetchError rather
+    than returning a partial list, which is the failure this module exists to
+    avoid.
+    """
+    parsed = parse_lines(text)
+    if not parsed.is_complete:
+        raise FetchError(
+            "requirements.txt references other files "
+            f"({', '.join(parsed.includes + parsed.constraints + parsed.editables)}) "
+            "and cannot be parsed without fetching them"
+        )
+    return parsed.requirements
 
 
 def _parse_setup_cfg(text: str) -> list[str]:
@@ -101,6 +116,53 @@ _PARSERS = {
 }
 
 
+def _repo_file_resolver(ref: GitHubRef, branch: str):
+    """A Resolver for includes.resolve_includes(), bound to one repo+branch."""
+    def resolve(path: str) -> str | None:
+        url = f"https://raw.githubusercontent.com/{ref.owner}/{ref.repo}/{branch}/{path}"
+        return _http_get(url)
+    return resolve
+
+
+def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: str) -> list[str]:
+    """Parse requirements.txt AND follow every -r/-c/-e it references.
+
+    Without this, a file whose real content is `-r base.txt` returned only the
+    handful of lines that happened to sit beside the include, and the caller
+    was told that was the complete set.
+    """
+    resolved = resolve_includes(filename, text, _repo_file_resolver(ref, branch))
+    # resolved.constraints are pins, not things to install — a constraint says
+    # "IF this package is pulled in, use this version". Merging them would turn
+    # every pin into a requirement (measured on home-assistant/core: 51 real
+    # requirements would have become 181). They are deliberately not returned.
+
+    # `-e .` and `-e ./pkg` name a package in this same repo; its real
+    # dependencies live in that directory's own pyproject/setup.cfg.
+    for target in resolved.local_editables:
+        prefix = "" if target in (".", "") else f"{target.rstrip('/')}/"
+        for candidate in ("pyproject.toml", "setup.cfg"):
+            sub = _http_get(
+                f"https://raw.githubusercontent.com/{ref.owner}/{ref.repo}/"
+                f"{branch}/{prefix}{candidate}"
+            )
+            if sub is None:
+                continue
+            try:
+                resolved.requirements.extend(_PARSERS[candidate](sub))
+            except Exception as e:
+                raise FetchError(f"failed to parse {prefix}{candidate} for -e {target}: {e}") from e
+            break
+
+    seen: set[str] = set()
+    deduped = []
+    for req in resolved.requirements:
+        if req not in seen:
+            seen.add(req)
+            deduped.append(req)
+    return deduped
+
+
 def _fetch_from_github(ref: GitHubRef) -> list[str]:
     branches = [ref.branch] if ref.branch else list(_BRANCH_FALLBACKS)
     tried = []
@@ -112,7 +174,15 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
             if text is None:
                 continue
             try:
-                reqs = _PARSERS[filename](text)
+                if filename == "requirements.txt":
+                    reqs = _fetch_requirements_txt(ref, branch, filename, text)
+                else:
+                    reqs = _PARSERS[filename](text)
+            except IncludeError as e:
+                # An unresolvable include means the requirement set is unknown.
+                # Failing loudly is the whole point — do not fall through to
+                # another candidate file and report a different, partial answer.
+                raise FetchError(f"{url}: {e}") from e
             except Exception as e:
                 raise FetchError(f"failed to parse {url}: {e}") from e
             if reqs:

@@ -131,7 +131,16 @@ answer computed by an older build.
 
 1. Fetch the requirement list — from `pyproject.toml`, `requirements.txt`,
    or `setup.cfg` on the GitHub repo, or from PyPI's JSON API for a bare
-   package name.
+   package name. A `requirements.txt` that uses `-r other.txt` has those
+   files fetched and spliced in, so the list is the complete one: on
+   `home-assistant/core` that is 51 requirements rather than the 47 visible
+   in the root file. An include that cannot be read is an error, never a
+   silently shorter list.
+
+   `-c` constraint files are read but kept separate — a constraint pins a
+   package *if* something pulls it in, so treating those entries as
+   requirements would inflate the same repo to 181 packages it never asked
+   to install.
 2. Create a disposable virtual environment.
 3. Run `pip install --dry-run` (or `uv pip install --dry-run`) against it —
    this resolves and would-download, but never actually installs anything

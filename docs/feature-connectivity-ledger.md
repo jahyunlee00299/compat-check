@@ -395,3 +395,118 @@
   - `ResolvedParams` now travels inside `probe_all()`'s result dict, so the dict is no longer
     purely JSON-serializable. Only the cached fields are persisted (the dataclass is re-derived on
     a hit, never stored), but a caller who blindly `json.dumps()` the whole result would now fail.
+
+## unit: reqline.py — requirement-line parsing (Unit 0)
+
+- **Scope**: core (replaces an ad-hoc filter with an explicit option table)
+- **Trigger**: benchmarking the v0.3 design against pip's `req_file.py`
+  (`docs/benchmark-fetcher-v0.3.md`). The design had scoped the work to `-r`/`-e`;
+  the benchmark showed the requirement *line* itself was mis-parsed in three ways,
+  all of them live in the published 0.2.0.
+- **The three defects, all measured reaching the resolver**:
+  - a line ending in `\` was never joined: `requests \` + `>=2.0` became two
+    malformed specs
+  - a trailing `# comment` was never stripped: uv received
+    `requests>=2.0  # pinned` and answered `Failed to parse`
+  - the filter matched prefixes (`"-r "`, `"-e "`, `"--"`), so `-c`, `-i` and `-f`
+    passed through as package names; `probe_all(["-i https://x"])` returned
+    `error: the following required arguments were not provided`
+  In every case the user was told **their repo** had a dependency problem.
+- **Change**: new `compat_check/reqline.py` — `join_continuations()`,
+  `strip_comment()` (a `#egg=` fragment survives), `env_vars_in()`, and
+  `parse_lines()` returning `ParsedRequirements(requirements, includes,
+  constraints, editables, skipped)` with an `is_complete` property. Classification
+  is done against an **explicit option table**, never a prefix, because prefix
+  matching is what produced all three defects. An unknown option is recorded as
+  skipped rather than passed through as a requirement.
+- **Security decision — divergence from pip, deliberate**: pip expands `${VAR}`
+  in requirement lines from its own environment. We do **not**. This tool reads
+  strangers' repositories, and expanding `--index-url https://${TOKEN}@…` from our
+  environment would splice a local secret into a subprocess argument. Such lines
+  are recorded as skipped, which also tells the truth: a private index means the
+  answer is incomplete by construction.
+- **Evidence (Prove)**: `tests/test_reqline.py` 15/15.
+- **Refutation (Refute)** — the benchmark cases re-run against the new parser:
+  - continuation joins to one spec; verified the joined form
+    (`"requests     >=2.0"`, inner whitespace preserved) is **actually accepted**
+    by `packaging.requirements.Requirement` AND by a live `probe_all()` — not
+    assumed from the PEP 508 grammar
+  - `#egg=mypkg` is not treated as a comment (pip requires whitespace before `#`)
+  - a commented-out continuation (`# disabled \`) does not swallow the next line
+  - all 19 known options classified, zero leak into `requirements`
+  - `--requirement=nested.txt` (equals form) parses
+  - `env_vars_in("$TOKEN") == []` — only the braced form, matching pypa/pip#3514
+- **Regress**: full suite re-run; the pre-existing 53 still pass.
+- **Connect**: `parse_lines()` is the only line classifier now; `fetcher.py`'s
+  `_parse_requirements_txt()` delegates to it and raises rather than returning a
+  partial list when the file has unresolved references.
+- **Deferred risk**:
+  - `--hash=...` per-requirement options are not stripped from a requirement line
+    (a hash-pinned requirements.txt would pass the hash through to the resolver).
+    Not yet seen in practice; unverified.
+  - The option table is a snapshot of pip's; a new pip option would be recorded
+    as "unrecognised" (safe — skipped, not passed through) until added here.
+
+## unit: includes.py — following -r / -c / -e (Unit 1)
+
+- **Scope**: core (this is the correctness fix; the other v0.3 units are coverage)
+- **The defect**: `fetch_requirements()`'s contract is "complete list or raise".
+  A `requirements.txt` containing `-r base.txt` dropped everything in `base.txt`
+  and handed the caller the remainder **as if it were the whole set** — the same
+  failure class as the `--python` bug fixed in 0.2.0: a confident wrong answer.
+- **Change**: new `compat_check/includes.py` — `resolve_includes(root_file, text,
+  resolver)` walks `-r`/`-c` recursively and reports `-e` targets. The parser stays
+  pure (`reqline.py` takes a string); the network stays in `fetcher.py`, injected
+  as a `Resolver` callable. Bounds: depth 8, 32 files total.
+- **Cycle detection copies pip's `_parse_and_recurse`**: a dict per branch,
+  `{path: first_including_file}`, copied on each descent — **not** the shared
+  `seen` set the design originally proposed. The distinction is load-bearing
+  because an unresolvable include is fatal here: with a set, a legal diamond
+  (`dev → base`, `dev → test → base`) and a true cycle are the same state, so we
+  would either raise on the diamond or miss the cycle.
+- **Evidence (Prove)**: `tests/test_includes.py` 12/12.
+- **Refutation (Refute)** — including two live repos, not fixtures alone:
+  - **the fix, measured on real repos**: `celery/celery:requirements/test.txt`
+    resolves 11 → **21** requirements; `home-assistant/core:requirements_test.txt`
+    resolves 47 → **51**. Before this unit, compat-check would have probed
+    home-assistant and reported "47 packages, all fine" while the `-r` include
+    was invisible to it.
+  - **a second wrong answer, found by verifying this unit's own deferred risk
+    instead of only recording it**: the first implementation merged `-c`
+    constraint entries into `requirements`, which took home-assistant to **181**
+    — 130 of those existed *only* as constraints. A constraint means "IF this
+    package is pulled in, pin it here", not "install this", so merging them
+    reproduced the same confident-wrong-answer defect in the opposite direction
+    (over-reporting instead of truncating). `ResolvedRequirements` now carries
+    `constraints` as a separate list, `fetch_requirements()` returns only the
+    requirements, and the measured figure is back to the correct 51.
+  - diamond include resolves (base.txt read twice, its requirement deduped once)
+    — the case a shared set breaks
+  - `a → b → a` and `a → a` both raise and name where the file was first included
+  - a missing include raises instead of returning the surviving lines
+  - relative paths resolve against the *including* file (`../base.txt` from
+    `requirements/dev.txt`), using posixpath — repo paths are URL paths, so
+    ntpath semantics must not leak in on Windows
+  - depth cap and file cap both trip
+  - `-e .`/`-e ./sub` are reported as local editables and resolved through the
+    repo's own pyproject/setup.cfg; `-e git+https://…` is a different project and
+    is recorded as skipped, not followed
+  - a malformed option inside an *included* file names that file, not the root
+- **Regress**: full suite 80/80 across 11 modules, 0 failures (was 53/53 across 9).
+  `fetch_requirements("requests")` and the flask URL both unchanged, confirming the
+  non-include paths did not regress.
+- **Connect**: `_fetch_from_github()` now routes `requirements.txt` through
+  `_fetch_requirements_txt()`, which builds a repo+branch-bound resolver. An
+  `IncludeError` is converted to `FetchError` **without falling through to another
+  candidate file** — falling through would answer a different, partial question.
+- **Deferred risk**:
+  - `-c` constraint entries are collected but **not** applied to the probe. pip
+    would pass them as `--constraint`, bounding versions of packages pulled in
+    transitively; we currently resolve without those bounds, so a dry-run can
+    succeed on a version combination the project itself would reject. Collecting
+    them separately is correct; feeding them to the resolver is not yet done.
+  - `local_editables` resolution reads only `pyproject.toml`/`setup.cfg` in the
+    target directory — a sub-package whose deps live in its own `requirements.txt`
+    is not followed a second level.
+  - The 32-file cap is global, not per-branch; a wide-but-shallow tree could trip
+    it before the depth cap does.
