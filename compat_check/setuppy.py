@@ -108,6 +108,76 @@ def _as_requirement_list(value: ast.expr, bindings: dict[str, ast.expr], what: s
     return requirements
 
 
+def parse_extras_require(text: str, extras: list[str]) -> list[str]:
+    """Return the requirements that ``extras`` select from ``extras_require``.
+
+    ``-e .[pg]`` genuinely requires what ``extras_require["pg"]`` lists
+    (records' ``pg`` is ``['psycopg2-binary']``), so resolving only the base
+    dependencies checks a smaller set than the project asked for.
+
+    An extra that is declared but computed at runtime, or not declared at all,
+    raises — the caller then reports a stated gap rather than a short list.
+    """
+    if not extras:
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        raise SetupPyError(f"setup.py is not valid Python: {e}") from e
+
+    call = _find_setup_call(tree)
+    if call is None:
+        raise SetupPyError("no setup() call found in setup.py")
+
+    bindings = _module_level_bindings(tree)
+    value = None
+    for keyword in call.keywords:
+        if keyword.arg == "extras_require":
+            value = keyword.value
+            break
+    if value is None:
+        raise SetupPyError("setup() declares no extras_require")
+
+    if isinstance(value, ast.Name):
+        bound = bindings.get(value.id)
+        if bound is None:
+            raise SetupPyError(
+                f"extras_require is the variable {value.id!r}, which is not "
+                f"assigned at module level"
+            )
+        value = bound
+
+    try:
+        mapping = ast.literal_eval(value)
+    except (ValueError, SyntaxError, TypeError):
+        raise SetupPyError(
+            f"extras_require is computed at runtime ({type(value).__name__})"
+        ) from None
+
+    if not isinstance(mapping, dict):
+        raise SetupPyError("extras_require is not a dict")
+
+    collected: list[str] = []
+    for extra in extras:
+        if extra not in mapping:
+            raise SetupPyError(
+                f"extra {extra!r} is not declared in extras_require "
+                f"(declared: {', '.join(sorted(map(str, mapping))) or 'none'})"
+            )
+        entries = mapping[extra]
+        if not isinstance(entries, (list, tuple)):
+            raise SetupPyError(f"extras_require[{extra!r}] is not a list")
+        for item in entries:
+            if not isinstance(item, str):
+                raise SetupPyError(
+                    f"extras_require[{extra!r}] contains a non-string entry"
+                )
+            item = item.strip()
+            if item:
+                collected.append(item)
+    return collected
+
+
 def parse_setup_py(text: str) -> list[str]:
     """Return ``install_requires`` from ``text``, or raise SetupPyError.
 

@@ -42,14 +42,15 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def make_cache_key(requirements: list[str], params: ResolvedParams) -> str:
+def make_cache_key(requirements: list[str], params: ResolvedParams,
+                    constraints: list[str] | None = None) -> str:
     """Hash the facts that actually determined the probe's outcome.
 
     Built from params.cache_identity() rather than the raw CLI values, so a
     version the backend ignored can never split one real result across two
     rows — and a compat-check version bump invalidates rather than reuses.
     """
-    normalized = json.dumps(cache_identity(requirements, params), sort_keys=True)
+    normalized = json.dumps(cache_identity(requirements, params, constraints), sort_keys=True)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -75,6 +76,7 @@ def cached_probe_all(
     db_path: Path | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     max_rows: int = DEFAULT_MAX_ROWS,
+    constraints: list[str] | None = None,
 ) -> dict:
     """probe_all(), but returns a cached result when one exists and hasn't expired.
 
@@ -86,7 +88,7 @@ def cached_probe_all(
     # Resolve before touching the DB: an invalid --python must fail the same
     # way whether or not a cached row happens to exist for it.
     params = resolve_params(python_version, backend_name)
-    cache_key = make_cache_key(requirements, params)
+    cache_key = make_cache_key(requirements, params, constraints)
 
     conn = _connect(db_path)
     try:
@@ -108,7 +110,8 @@ def cached_probe_all(
                     "cache_hit": True,
                 }
 
-        result = probe_all(requirements, python_version=python_version, max_rounds=max_rounds)
+        result = probe_all(requirements, python_version=python_version,
+                            max_rounds=max_rounds, constraints=constraints)
         conn.execute(
             "INSERT OR REPLACE INTO probe_cache "
             "(cache_key, ok, failures_json, resolved_json, backend, checked_at) "

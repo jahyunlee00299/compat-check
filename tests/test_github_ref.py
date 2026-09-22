@@ -66,6 +66,11 @@ def test_unparseable_github_string_does_not_become_a_pypi_lookup():
     raise AssertionError("should have raised a GitHub-specific error")
 
 
+def _clear_cache():
+    """The branch cache is process-level state shared by these tests."""
+    fetcher._BRANCH_CACHE.clear()
+
+
 def _http_error(code, headers=None):
     return urllib.error.HTTPError(
         "https://api.github.com/repos/o/r", code, "err", headers or {}, None,
@@ -73,6 +78,7 @@ def _http_error(code, headers=None):
 
 
 def test_lookup_returns_the_real_default_branch():
+    _clear_cache()
     payload = b'{"default_branch": "develop"}'
     fake = mock.MagicMock()
     fake.__enter__.return_value.read.return_value = payload
@@ -84,6 +90,7 @@ def test_lookup_returns_the_real_default_branch():
 
 def test_404_says_private_or_missing_without_claiming_which():
     """GitHub returns 404 for both; verified against github/github."""
+    _clear_cache()
     with mock.patch.object(fetcher.urllib.request, "urlopen",
                             side_effect=_http_error(404)):
         got = _lookup_repo(GitHubRef("o", "r", None))
@@ -93,6 +100,7 @@ def test_404_says_private_or_missing_without_claiming_which():
 
 
 def test_rate_limit_is_reported_as_such():
+    _clear_cache()
     err = _http_error(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1000000"})
     with mock.patch.object(fetcher.urllib.request, "urlopen", side_effect=err):
         got = _lookup_repo(GitHubRef("o", "r", None))
@@ -101,6 +109,7 @@ def test_rate_limit_is_reported_as_such():
 
 
 def test_a_403_that_is_not_rate_limiting_falls_back_instead_of_diagnosing():
+    _clear_cache()
     err = _http_error(403, {"X-RateLimit-Remaining": "42"})
     with mock.patch.object(fetcher.urllib.request, "urlopen", side_effect=err):
         got = _lookup_repo(GitHubRef("o", "r", None))
@@ -110,6 +119,7 @@ def test_a_403_that_is_not_rate_limiting_falls_back_instead_of_diagnosing():
 
 def test_network_failure_degrades_to_the_old_branch_guessing():
     """The API is an optimization, never a new hard dependency."""
+    _clear_cache()
     with mock.patch.object(fetcher.urllib.request, "urlopen",
                             side_effect=urllib.error.URLError("down")):
         got = _lookup_repo(GitHubRef("o", "r", None))
@@ -124,8 +134,10 @@ def test_network_failure_degrades_to_the_old_branch_guessing():
 
     with mock.patch.object(fetcher, "_lookup_repo", return_value=fetcher.RepoLookup()), \
          mock.patch.object(fetcher, "_http_get", side_effect=fake_get):
-        reqs = fetcher._fetch_from_github(GitHubRef("o", "r", None))
-    assert reqs == ["requests"]
+        found = fetcher._fetch_from_github(GitHubRef("o", "r", None))
+    # _fetch_from_github now returns a FetchResult so constraints can travel
+    # with the requirements; the requirement list itself is unchanged.
+    assert found.requirements == ["requests"]
     assert any("/main/" in c for c in calls), "should still try main first"
     assert any("/master/" in c for c in calls), "should still fall back to master"
 
@@ -177,6 +189,43 @@ def test_not_found_error_names_the_branch_searched():
             assert "trunk" in str(e)
             return
     raise AssertionError("should raise")
+
+
+def test_branch_lookup_is_cached_within_the_process():
+    """A repo's default branch does not change mid-run, and the budget is 60/hour."""
+    _clear_cache()
+    payload = b'{"default_branch": "trunk"}'
+    fake = mock.MagicMock()
+    fake.__enter__.return_value.read.return_value = payload
+    with mock.patch.object(fetcher.urllib.request, "urlopen",
+                            return_value=fake) as urlopen:
+        for _ in range(3):
+            got = _lookup_repo(GitHubRef("o", "r", None))
+            assert got.default_branch == "trunk"
+    assert urlopen.call_count == 1, urlopen.call_count
+    _clear_cache()
+
+
+def test_a_404_diagnosis_is_cached_too():
+    _clear_cache()
+    with mock.patch.object(fetcher.urllib.request, "urlopen",
+                            side_effect=_http_error(404)) as urlopen:
+        for _ in range(3):
+            _lookup_repo(GitHubRef("o", "missing", None))
+    assert urlopen.call_count == 1
+    _clear_cache()
+
+
+def test_rate_limiting_is_NOT_cached_so_a_later_call_can_retry():
+    """The limit resets; caching it would keep failing for the whole process."""
+    _clear_cache()
+    err = _http_error(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1000000"})
+    with mock.patch.object(fetcher.urllib.request, "urlopen",
+                            side_effect=err) as urlopen:
+        for _ in range(3):
+            _lookup_repo(GitHubRef("o", "r", None))
+    assert urlopen.call_count == 3, urlopen.call_count
+    _clear_cache()
 
 
 if __name__ == "__main__":

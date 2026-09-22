@@ -144,7 +144,7 @@ def test_local_editable_is_reported_external_one_is_skipped():
     files = {"requirements.txt": "-e .\n-e ./sub\n-e git+https://example.com/o.git\nreq\n"}
     got = resolve_includes("requirements.txt", files["requirements.txt"], fake_resolver(files))
     assert got.requirements == ["req"]
-    assert got.local_editables == [".", "sub"]
+    assert got.local_editables == [(".", []), ("sub", [])]
     assert any("not followed" in s for s in got.skipped)
 
 
@@ -157,19 +157,18 @@ def test_editable_extras_are_stripped_from_the_path():
     files = {"requirements.txt": "-e .[pg]\n-e ./sub[extra]\npytest\n"}
     got = resolve_includes("requirements.txt", files["requirements.txt"],
                             fake_resolver(files))
-    assert got.local_editables == [".", "sub"], got.local_editables
+    # Extras are carried alongside the path, not discarded: records' `[pg]`
+    # really does require psycopg2-binary, and the caller resolves it.
+    assert got.local_editables == [(".", ["pg"]), ("sub", ["extra"])], got.local_editables
     assert got.requirements == ["pytest"]
-    # The extras themselves are not resolved (records' `[pg]` really does pull
-    # psycopg2-binary), so the limitation is stated rather than left silent.
-    assert len(got.skipped) == 2, got.skipped
-    assert all("extras" in s and "not resolved" in s for s in got.skipped)
+    assert got.skipped == []
 
 
 def test_editable_without_extras_produces_no_skip_note():
     files = {"requirements.txt": "-e .\npytest\n"}
     got = resolve_includes("requirements.txt", files["requirements.txt"],
                             fake_resolver(files))
-    assert got.local_editables == ["."]
+    assert got.local_editables == [(".", [])]
     assert got.skipped == []
 
 

@@ -38,7 +38,8 @@ class _Backend(ABC):
         ...
 
     @abstractmethod
-    def dry_run_install(self, venv_path: Path, requirements: list[str]) -> subprocess.CompletedProcess:
+    def dry_run_install(self, venv_path: Path, requirements: list[str],
+                         constraint_file: Path | None = None) -> subprocess.CompletedProcess:
         ...
 
     @abstractmethod
@@ -83,8 +84,12 @@ class _UvBackend(_Backend):
     def create_venv(self, venv_path: Path, python_version: str) -> subprocess.CompletedProcess:
         return _run(["uv", "venv", str(venv_path), "--python", python_version])
 
-    def dry_run_install(self, venv_path: Path, requirements: list[str]) -> subprocess.CompletedProcess:
-        return _run(["uv", "pip", "install", "--dry-run", "--python", str(venv_path), *requirements])
+    def dry_run_install(self, venv_path: Path, requirements: list[str],
+                         constraint_file: Path | None = None) -> subprocess.CompletedProcess:
+        cmd = ["uv", "pip", "install", "--dry-run", "--python", str(venv_path)]
+        if constraint_file is not None:
+            cmd += ["--constraint", str(constraint_file)]
+        return _run([*cmd, *requirements])
 
     def parse(self, proc: subprocess.CompletedProcess) -> ProbeResult:
         ok = proc.returncode == 0
@@ -131,9 +136,13 @@ class _PipBackend(_Backend):
             return str(venv_path / "Scripts" / "python.exe")
         return str(venv_path / "bin" / "python")
 
-    def dry_run_install(self, venv_path: Path, requirements: list[str]) -> subprocess.CompletedProcess:
+    def dry_run_install(self, venv_path: Path, requirements: list[str],
+                         constraint_file: Path | None = None) -> subprocess.CompletedProcess:
         py = self._venv_python(venv_path)
-        return _run([py, "-m", "pip", "install", "--dry-run", *requirements])
+        cmd = [py, "-m", "pip", "install", "--dry-run"]
+        if constraint_file is not None:
+            cmd += ["--constraint", str(constraint_file)]
+        return _run([*cmd, *requirements])
 
     def parse(self, proc: subprocess.CompletedProcess) -> ProbeResult:
         ok = proc.returncode == 0
@@ -177,8 +186,17 @@ def _select_backend() -> _Backend:
 
 
 def probe_once(requirements: list[str], python_version: str = "3.11",
-                backend: _Backend | None = None) -> ProbeResult:
-    """Create a throwaway venv and dry-run install the given requirement specs."""
+                backend: _Backend | None = None,
+                constraints: list[str] | None = None) -> ProbeResult:
+    """Create a throwaway venv and dry-run install the given requirement specs.
+
+    `constraints` are the entries of any `-c` file the source declared. They
+    bound versions WITHOUT requesting installation, which is what pip and uv
+    both mean by --constraint. Measured: resolving `requests` against
+    `urllib3<1.0` yields requests==2.15.1 instead of the latest — ignoring the
+    constraint file silently checks a different version set than the project
+    itself would install.
+    """
     backend = backend or _select_backend()
     with tempfile.TemporaryDirectory(prefix="compat_check_") as tmp:
         venv_path = Path(tmp) / "venv"
@@ -189,11 +207,17 @@ def probe_once(requirements: list[str], python_version: str = "3.11",
         if not requirements:
             return ProbeResult(ok=True, stdout="", stderr="")
 
-        install = backend.dry_run_install(venv_path, requirements)
+        constraint_file = None
+        if constraints:
+            constraint_file = Path(tmp) / "constraints.txt"
+            constraint_file.write_text("\n".join(constraints) + "\n", encoding="utf-8")
+
+        install = backend.dry_run_install(venv_path, requirements, constraint_file)
         return backend.parse(install)
 
 
-def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds: int = 20) -> dict:
+def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds: int = 20,
+               constraints: list[str] | None = None) -> dict:
     """Repeatedly probe, dropping each failing package, to surface every failure.
 
     Returns {"ok": bool, "backend": str, "params": ResolvedParams,
@@ -212,7 +236,8 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
     seen_failing: set[str] = set()
 
     for _ in range(max_rounds):
-        result = probe_once(remaining, python_version, backend=backend)
+        result = probe_once(remaining, python_version, backend=backend,
+                             constraints=constraints)
         if result.ok:
             return {"ok": not failures, "backend": backend.name, "params": params,
                      "failures": failures, "resolved": result.resolved_packages}
@@ -227,6 +252,7 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
         failures.append({"package": pkg, "stderr": combined_output})
         remaining = [r for r in remaining if not r.lower().startswith(pkg.lower())]
 
-    final = probe_once(remaining, python_version, backend=backend)
+    final = probe_once(remaining, python_version, backend=backend,
+                        constraints=constraints)
     return {"ok": False, "backend": backend.name, "params": params,
              "failures": failures, "resolved": final.resolved_packages}
