@@ -75,9 +75,20 @@ def _normalize_resolved(token: str) -> str:
 class _UvBackend(_Backend):
     name = "uv"
 
-    _NO_VERSION_RE = re.compile(r"no version of ([A-Za-z0-9_.\-]+)")
+    # uv wraps its diagnosis at ~80 columns, so a package name can be split
+    # across lines from the phrase that introduces it. Every pattern below
+    # therefore tolerates a newline + indentation wherever a space appears.
+    # Wordings captured from real runs; see tests/test_runner_errors.py.
+    _NO_VERSION_RE = re.compile(r"no\s+version\s+of\s+([A-Za-z0-9_.\-]+)")
     _UNSATISFIABLE_RE = re.compile(
-        r"because you require ([A-Za-z0-9_.\-]+)[><=! ]", re.IGNORECASE,
+        r"because\s+you\s+require\s+([A-Za-z0-9_.\-]+)[><=!,\s]", re.IGNORECASE,
+    )
+    # "Because <pkg> was not found in the package registry" — a name that was
+    # never published (typo, private package, renamed project). Previously
+    # unmatched, so failing_package came back None and probe_all() stopped
+    # after one round, hiding every other failure behind "<unknown>".
+    _NOT_FOUND_RE = re.compile(
+        r"[Bb]ecause\s+([A-Za-z0-9_.\-]+)\s+was\s+not\s+found\s+in\s+the\s+package\s+registry",
     )
     _ABI_MISMATCH_RE = re.compile(r"([A-Za-z0-9_.\-]+) \(v[^)]+\) has no wheels")
 
@@ -106,7 +117,17 @@ class _UvBackend(_Backend):
                             resolved_packages=resolved, failing_package=failing)
 
     def _extract_failing_package(self, stderr: str) -> str | None:
-        for pattern in (self._ABI_MISMATCH_RE, self._NO_VERSION_RE, self._UNSATISFIABLE_RE):
+        # Order matters: the specific diagnoses come first. _UNSATISFIABLE_RE
+        # matches the generic "you require <pkg>" tail that uv appends to
+        # nearly every message, so it must be the last resort — otherwise a
+        # "not found in the registry" error would be attributed by the tail
+        # rather than by the sentence that actually names the cause.
+        for pattern in (
+            self._ABI_MISMATCH_RE,
+            self._NOT_FOUND_RE,
+            self._NO_VERSION_RE,
+            self._UNSATISFIABLE_RE,
+        ):
             m = pattern.search(stderr)
             if m:
                 return m.group(1)
@@ -185,6 +206,27 @@ def _select_backend() -> _Backend:
     return _PipBackend()
 
 
+_REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)")
+
+
+def _requirement_name(spec: str) -> str:
+    """The distribution name at the head of a requirement spec.
+
+    `requirement_matches()` used to drop entries with `startswith(pkg)`, which
+    is prefix matching: dropping `pkg1` also dropped `pkg10`..`pkg19`, since
+    those names begin with `pkg1`. Measured with 25 distinct unsatisfiable
+    packages — the loop finished in 10 rounds having silently discarded 15 of
+    them, neither probed nor reported. Names are compared whole instead.
+    """
+    m = _REQ_NAME_RE.match(spec)
+    return (m.group(1) if m else spec).strip().lower().replace("_", "-")
+
+
+def _drops(spec: str, package: str) -> bool:
+    """True when `spec` requests `package` (PEP 503 normalized name match)."""
+    return _requirement_name(spec) == package.strip().lower().replace("_", "-")
+
+
 def probe_once(requirements: list[str], python_version: str = "3.11",
                 backend: _Backend | None = None,
                 constraints: list[str] | None = None) -> ProbeResult:
@@ -221,7 +263,11 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
     """Repeatedly probe, dropping each failing package, to surface every failure.
 
     Returns {"ok": bool, "backend": str, "params": ResolvedParams,
-    "failures": [{"package": str, "stderr": str}], "resolved": [str]}.
+    "failures": [{"package": str, "stderr": str}], "resolved": [str],
+    "truncated": bool}.
+
+    `truncated` is True when `max_rounds` was exhausted with requirements left
+    unprobed — the failure list is then a lower bound, not the whole story.
 
     The python version is resolved through params.resolve_params() before any
     venv is built, so an invalid value fails here rather than inside uv, and a
@@ -235,12 +281,14 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
     failures: list[dict] = []
     seen_failing: set[str] = set()
 
-    for _ in range(max_rounds):
+    truncated = False
+    for round_number in range(max_rounds):
         result = probe_once(remaining, python_version, backend=backend,
                              constraints=constraints)
         if result.ok:
             return {"ok": not failures, "backend": backend.name, "params": params,
-                     "failures": failures, "resolved": result.resolved_packages}
+                     "failures": failures, "resolved": result.resolved_packages,
+                     "truncated": False}
 
         combined_output = "\n".join(s for s in (result.stderr, result.stdout) if s)
         pkg = result.failing_package
@@ -250,9 +298,16 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
 
         seen_failing.add(pkg)
         failures.append({"package": pkg, "stderr": combined_output})
-        remaining = [r for r in remaining if not r.lower().startswith(pkg.lower())]
+        remaining = [r for r in remaining if not _drops(r, pkg)]
+    else:
+        # The loop ran out of rounds rather than resolving. Anything still in
+        # `remaining` was never probed: reporting only what we found would
+        # present a partial list as complete, which is the failure this whole
+        # tool exists to avoid.
+        truncated = bool(remaining)
 
     final = probe_once(remaining, python_version, backend=backend,
                         constraints=constraints)
     return {"ok": False, "backend": backend.name, "params": params,
-             "failures": failures, "resolved": final.resolved_packages}
+             "failures": failures, "resolved": final.resolved_packages,
+             "truncated": truncated}

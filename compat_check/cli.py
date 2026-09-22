@@ -52,7 +52,11 @@ def _print_report(source: str, requirements: list[str], result: dict,
             print(f"  + {pkg}")
         return
 
-    print(f"PROBLEMS FOUND — {len(result['failures'])} package(s) cannot be resolved:")
+    if result.get("truncated"):
+        print(f"PROBLEMS FOUND — at least {len(result['failures'])} package(s) cannot "
+              f"be resolved (the probe hit its round limit; there may be more):")
+    else:
+        print(f"PROBLEMS FOUND — {len(result['failures'])} package(s) cannot be resolved:")
     for f in result["failures"]:
         print(f"\n  [{f['package']}]")
         # Indent the raw resolver output so it reads as evidence, not noise.
@@ -105,7 +109,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.tree:
         print()
-        tree_result = build_tree(requirements, python_version=args.python_version)
+        # Same constraints as the probe above, or the tree would describe a
+        # different resolution than the report the user just read.
+        tree_result = build_tree(requirements, python_version=args.python_version,
+                                  constraints=constraints)
         if tree_result["ok"]:
             print(render_tree(tree_result["roots"], label=args.source))
         else:

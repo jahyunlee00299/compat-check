@@ -500,11 +500,10 @@
   `IncludeError` is converted to `FetchError` **without falling through to another
   candidate file** — falling through would answer a different, partial question.
 - **Deferred risk**:
-  - `-c` constraint entries are collected but **not** applied to the probe. pip
-    would pass them as `--constraint`, bounding versions of packages pulled in
-    transitively; we currently resolve without those bounds, so a dry-run can
-    succeed on a version combination the project itself would reject. Collecting
-    them separately is correct; feeding them to the resolver is not yet done.
+  - ~~`-c` entries collected but not applied~~ — **CLOSED in 0.5.0**: both
+    backends now receive `--constraint`. Note the original wording was wrong
+    about the symptom: an impossible constraint does not produce a conflict,
+    the resolver walks back to an older release. See the 0.5.0 unit.
   - `local_editables` resolution reads only `pyproject.toml`/`setup.cfg` in the
     target directory — a sub-package whose deps live in its own `requirements.txt`
     is not followed a second level.
@@ -572,8 +571,9 @@
     the branch lookup happens regardless. At 60/hour this is tolerable for
     interactive use and would matter in a loop. Fixing it means caching the
     fetch itself, which is a separate design (provenance, TTL, invalidation).
-  - The branch lookup result is not cached within a process either; two
-    `fetch_requirements()` calls for the same repo make two API calls.
+  - ~~Branch lookup not cached within a process~~ — **CLOSED in 0.5.0**
+    (`_BRANCH_CACHE`). Across separate CLI invocations it still costs one
+    request each; persisting it needs invalidation for a renamed branch.
   - `looks_like_github()` is a substring test, so a PyPI package legitimately
     named with `github.com` inside it would be misrouted. No such package
     exists; the trade-off favours the common typo.
@@ -645,12 +645,8 @@
   - Only module-level bindings are followed. `REQS = [...]` inside an
     `if sys.version_info >= (3, 8):` block is not seen; the call raises rather
     than picking a branch. Correct but narrower than reality.
-  - `extras_require` is not read — consistent with pyproject's
-    `optional-dependencies` being skipped. Verified this is a real gap, not a
-    theoretical one: records' `extras_require["pg"]` is `['psycopg2-binary']`,
-    which `-e .[pg]` genuinely requires and we do not check. It is no longer
-    *silent*: an editable carrying extras now emits a skip note naming them, so
-    the answer is short by a stated amount rather than quietly.
+  - ~~`extras_require` is not read~~ — **CLOSED in 0.5.0**: read by AST under
+    the same no-execution rule, so `-e .[pg]` now resolves psycopg2-binary.
   - A `setup.cfg` that exists but declares no `install_requires` returns `[]`
     and the search moves on to `setup.py`; a `setup.cfg` with a *broken*
     `install_requires` still raises immediately rather than falling through.
@@ -742,3 +738,89 @@ notes to stderr.
   - pyproject `optional-dependencies` are read only for an explicit `-e .[x]`;
     a bare `-e .` still resolves base dependencies only, which is correct but
     means the two paths read different parts of the same file.
+
+## unit: runner/cache/tree audit — failure attribution and schema migration (0.6.0)
+
+- **Scope**: core (correctness). No new capability; four defects in features
+  the ledger had not retested since 0.1–0.2.
+- **Trigger**: with the fetcher axis closed, audited the rest — runner, cache,
+  tree, CLI — against claims made in the early ledger.
+
+### 1. uv's "not found in the registry" matched no regex
+
+- **Measured**: 25 distinct unsatisfiable packages produced **one** failure,
+  reported as `<unknown>`. Collecting uv's real wordings showed three shapes;
+  only `Because <pkg> was not found in the package registry` was uncovered, so
+  `failing_package` returned None and `probe_all()` broke out after one round.
+  **A single mistyped package name hid every other failure in the file.**
+- **Change**: `_NOT_FOUND_RE`, placed before `_UNSATISFIABLE_RE` in
+  `_extract_failing_package()` — the latter matches the generic "you require
+  <pkg>" tail uv appends to almost every message, so it must stay last or it
+  would attribute the error by the tail rather than by the sentence naming the
+  cause. All patterns now tolerate uv's ~80-column line wrapping (`\s+` rather
+  than a literal space), since a name can be split from its introducing phrase.
+
+### 2. Retry dropped packages by prefix
+
+- **Measured**, after fixing (1): still only 10 of 25 reported. Cause was
+  `remaining = [r for r in remaining if not r.lower().startswith(pkg.lower())]`
+  — dropping `pkg1` also dropped `pkg10`..`pkg19`. Fifteen packages were
+  **neither probed nor reported**, silently discarded mid-loop. This is the
+  same prefix-matching class as the 0.3.0 reqline defect.
+- **Change**: `_requirement_name()` + `_drops()` compare whole PEP 503
+  normalized names (`charset_normalizer` == `charset-normalizer`).
+- **Refute**: `xyz1` and `xyz10` are now each probed and each reported; 25
+  packages yield 20 failures (the real round cap) instead of 10.
+
+### 3. Hitting `max_rounds` was silent
+
+- **The ledger's oldest open risk** ("untested against >20 simultaneous
+  failures"), and the measurement showed the cap does not merely go untested —
+  when reached, the partial failure list was returned with nothing marking it
+  partial. A user fixes what is shown, re-runs, and discovers more.
+- **Change**: `probe_all()` returns `truncated: bool`, set from the `for/else`
+  branch when rounds ran out with requirements left. The CLI then prints
+  "at least N package(s) … there may be more" instead of a bare count.
+- **Refute**: 25 packages → `truncated=True`; 2 packages → False; a clean
+  resolve → False. The flag is persisted in the cache and re-read on a hit, so
+  a cached truncated result does not come back looking complete.
+
+### 4. Adding that column broke every existing install
+
+- **Found by the suite failing against a real `~/.cache/compat_check/history.db`
+  written by 0.5.0**: `CREATE TABLE IF NOT EXISTS` does not alter an existing
+  table, so the new `truncated` column did not appear and every query naming it
+  raised `sqlite3.OperationalError: no such column`. This would have hit **every
+  upgrading user on first run** — the kind of defect only a real artifact
+  surfaces, since a fresh temp DB in a test always has the new schema.
+- **Change**: `_MIGRATIONS` + `_migrate()`, applied on every `_connect()`,
+  keyed on `PRAGMA table_info`.
+- **Refute**: a hand-built pre-0.6 database gains the column and **keeps its
+  existing row** (defaulted to 0, not dropped); running `_connect()` repeatedly
+  adds the column exactly once.
+
+### 5. `--tree` ignored constraints
+
+- With constraints applied to the probe in 0.5.0 but not the tree, `--tree`
+  drew a **different resolution than the report printed directly above it**.
+- `uv tree` has no `--constraint` flag (checked `--help`), but it reads
+  `[tool.uv] constraint-dependencies` from the manifest `build_tree()` already
+  writes. Verified interactively before wiring.
+- **Refute**: `requests` alone trees as v2.34.2; under `urllib3<1.0` it trees
+  as **v2.15.1** — the same version `probe_all()` reports, so the two halves of
+  the output now agree.
+
+- **Regress**: 148/148 across 15 modules, 0 failures (was 131/131 across 14).
+- **Ledger corrections**: three entries still read as open that 0.5.0 had
+  closed (`-c` unapplied, `extras_require` unread, branch lookup uncached).
+  Marked closed. The `-c` entry's original wording was also **wrong about the
+  symptom** and is annotated as such rather than quietly deleted.
+- **Deferred risk**:
+  - `max_rounds=20` is unchanged; `truncated` makes hitting it visible but a
+    requirements file with more than 20 broken packages still needs two runs.
+  - The uv wording table is a snapshot. A future uv release rewording its
+    diagnosis would return `failing_package=None` again — the failure is safe
+    (`<unknown>`, no wrong attribution) but the multi-failure walk would stop.
+    No detection for "uv changed its wording" as distinct from "one failure".
+  - `_MIGRATIONS` only adds columns. A future change needing a type change or
+    a drop would need a table rebuild, which this mechanism does not do.

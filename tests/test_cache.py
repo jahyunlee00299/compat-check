@@ -100,6 +100,68 @@ def test_expired_entry_forces_a_fresh_probe():
         assert second["cache_hit"] is False
 
 
+def test_a_database_from_an_older_version_is_migrated_not_broken():
+    """CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+
+    Without a migration, upgrading crashed with "no such column: truncated"
+    against any ~/.cache/compat_check/history.db written by 0.5.0 or earlier.
+    """
+    import sqlite3
+    from compat_check.cache import _connect
+
+    with tempfile.TemporaryDirectory(prefix="compat_check_migrate_") as tmp:
+        db_path = Path(tmp) / "old.db"
+        legacy = sqlite3.connect(str(db_path))
+        legacy.execute(
+            "CREATE TABLE probe_cache (cache_key TEXT PRIMARY KEY, ok INTEGER NOT NULL,"
+            " failures_json TEXT NOT NULL, resolved_json TEXT NOT NULL,"
+            " backend TEXT NOT NULL, checked_at REAL NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO probe_cache VALUES ('k', 1, '[]', '[]', 'uv', 1000.0)"
+        )
+        legacy.commit()
+        legacy.close()
+
+        conn = _connect(db_path)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(probe_cache)")}
+            assert "truncated" in columns, columns
+            # The pre-existing row survives, defaulted rather than dropped.
+            row = conn.execute("SELECT cache_key, truncated FROM probe_cache").fetchone()
+            assert row == ("k", 0), row
+        finally:
+            conn.close()
+
+
+def test_migration_is_idempotent():
+    from compat_check.cache import _connect
+
+    with tempfile.TemporaryDirectory(prefix="compat_check_migrate2_") as tmp:
+        db_path = Path(tmp) / "h.db"
+        for _ in range(3):
+            conn = _connect(db_path)
+            conn.close()
+        conn = _connect(db_path)
+        try:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(probe_cache)")]
+            assert columns.count("truncated") == 1, columns
+        finally:
+            conn.close()
+
+
+def test_truncated_survives_a_cache_round_trip():
+    """A truncated result must not look complete after a hit."""
+    with tempfile.TemporaryDirectory(prefix="compat_check_trunc_") as tmp:
+        db_path = Path(tmp) / "history.db"
+        pkgs = [f"definitely-not-a-real-pkg-c{i:02d}" for i in range(6)]
+        first = cached_probe_all(pkgs, db_path=db_path, max_rounds=2)
+        second = cached_probe_all(pkgs, db_path=db_path, max_rounds=2)
+        assert first["cache_hit"] is False and second["cache_hit"] is True
+        assert first["truncated"] is True
+        assert second["truncated"] is True, "a hit hid the truncation warning"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
