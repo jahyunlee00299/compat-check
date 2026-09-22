@@ -30,15 +30,35 @@ CREATE TABLE IF NOT EXISTS probe_cache (
     failures_json TEXT NOT NULL,
     resolved_json TEXT NOT NULL,
     backend TEXT NOT NULL,
-    checked_at REAL NOT NULL
+    checked_at REAL NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0
 )
 """
+
+
+#: Columns added after the first release. CREATE TABLE IF NOT EXISTS does not
+#: touch an existing table, so a database written by an older compat-check
+#: keeps its old shape — and every query naming a new column fails with
+#: "no such column". Found by running the suite against a real
+#: ~/.cache/compat_check/history.db from 0.5.0.
+_MIGRATIONS = (
+    ("truncated", "ALTER TABLE probe_cache ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(probe_cache)")}
+    for column, statement in _MIGRATIONS:
+        if column not in existing:
+            conn.execute(statement)
+    conn.commit()
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute(_SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -93,13 +113,13 @@ def cached_probe_all(
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            "SELECT ok, failures_json, resolved_json, backend, checked_at "
+            "SELECT ok, failures_json, resolved_json, backend, checked_at, truncated "
             "FROM probe_cache WHERE cache_key = ?",
             (cache_key,),
         ).fetchone()
 
         if row is not None:
-            ok, failures_json, resolved_json, backend, checked_at = row
+            ok, failures_json, resolved_json, backend, checked_at, truncated = row
             if time.time() - checked_at < ttl_seconds:
                 return {
                     "ok": bool(ok),
@@ -107,6 +127,9 @@ def cached_probe_all(
                     "failures": json.loads(failures_json),
                     "resolved": json.loads(resolved_json),
                     "params": params,
+                    # A truncated result must not look complete after a cache
+                    # hit — that would hide the lower-bound warning.
+                    "truncated": bool(truncated),
                     "cache_hit": True,
                 }
 
@@ -114,8 +137,8 @@ def cached_probe_all(
                             max_rounds=max_rounds, constraints=constraints)
         conn.execute(
             "INSERT OR REPLACE INTO probe_cache "
-            "(cache_key, ok, failures_json, resolved_json, backend, checked_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(cache_key, ok, failures_json, resolved_json, backend, checked_at, truncated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 cache_key,
                 int(result["ok"]),
@@ -123,6 +146,7 @@ def cached_probe_all(
                 json.dumps(result["resolved"]),
                 result["backend"],
                 time.time(),
+                int(result.get("truncated", False)),
             ),
         )
         _evict_if_needed(conn, max_rows)

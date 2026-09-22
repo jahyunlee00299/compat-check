@@ -76,11 +76,18 @@ def _parse_uv_tree_output(text: str) -> list[TreeNode]:
     return roots
 
 
-def build_tree(requirements: list[str], python_version: str = "3.11") -> dict:
+def build_tree(requirements: list[str], python_version: str = "3.11",
+                constraints: list[str] | None = None) -> dict:
     """Return {"ok": bool, "roots": [TreeNode.to_dict(), ...], "stderr": str}.
 
     Requires `uv` — pip has no equivalent tree command. Callers should check
     for uv availability first (see cli.py) and degrade gracefully.
+
+    `constraints` are applied through `[tool.uv] constraint-dependencies`
+    (`uv tree` has no --constraint flag). Without them the tree would show a
+    different resolution than the report printed directly above it: verified
+    that `requests` under `urllib3<1.0` trees as requests v2.15.1, matching
+    what probe_all() reports rather than the unconstrained latest.
     """
     if not shutil.which("uv"):
         return {"ok": False, "roots": [], "stderr": "uv is required for dependency tree visualization"}
@@ -88,11 +95,16 @@ def build_tree(requirements: list[str], python_version: str = "3.11") -> dict:
     with tempfile.TemporaryDirectory(prefix="compat_check_tree_") as tmp:
         proj_dir = Path(tmp)
         deps_toml = ", ".join(f'"{r}"' for r in requirements)
-        (proj_dir / "pyproject.toml").write_text(
+        manifest = (
             f'[project]\nname = "compat-check-probe"\nversion = "0.0.0"\n'
-            f'requires-python = ">={python_version}"\ndependencies = [{deps_toml}]\n',
-            encoding="utf-8",
+            f'requires-python = ">={python_version}"\ndependencies = [{deps_toml}]\n'
         )
+        if constraints:
+            # `uv tree` has no --constraint flag; the manifest is how it takes
+            # them. Verified: requests under urllib3<1.0 trees as v2.15.1.
+            cons_toml = ", ".join(f'"{c}"' for c in constraints)
+            manifest += f'\n[tool.uv]\nconstraint-dependencies = [{cons_toml}]\n'
+        (proj_dir / "pyproject.toml").write_text(manifest, encoding="utf-8")
         proc = subprocess.run(
             ["uv", "tree", "--universal"],
             cwd=str(proj_dir), capture_output=True, text=True,

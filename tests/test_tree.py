@@ -53,6 +53,35 @@ def test_falls_back_cleanly_without_uv():
     assert "uv" in result["stderr"]
 
 
+def _find_version(roots, name):
+    for node in roots:
+        if node["name"] == name:
+            return node["version"]
+        found = _find_version(node.get("children", []), name)
+        if found:
+            return found
+    return None
+
+
+def test_tree_applies_constraints_so_it_matches_the_report():
+    """Without this the tree described a different resolution than the report
+    printed directly above it."""
+    bare = build_tree(["requests"])
+    bound = build_tree(["requests"], constraints=["urllib3<1.0"])
+    assert bare["ok"] and bound["ok"], (bare["stderr"], bound["stderr"])
+    a = _find_version(bare["roots"], "requests")
+    b = _find_version(bound["roots"], "requests")
+    assert a and b, (a, b)
+    assert a != b, f"constraint had no effect on the tree: {a}"
+
+
+def test_tree_without_constraints_is_unchanged():
+    a = build_tree(["certifi"])
+    b = build_tree(["certifi"], constraints=[])
+    assert a["ok"] and b["ok"]
+    assert _find_version(a["roots"], "certifi") == _find_version(b["roots"], "certifi")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
