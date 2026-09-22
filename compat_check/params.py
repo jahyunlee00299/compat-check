@@ -126,7 +126,8 @@ def resolve_params(python_version: str, backend_name: str) -> ResolvedParams:
     )
 
 
-def cache_identity(requirements: list[str], params: ResolvedParams) -> dict:
+def cache_identity(requirements: list[str], params: ResolvedParams,
+                    constraints: list[str] | None = None) -> dict:
     """The exact set of facts that determine a probe's outcome.
 
     Deliberately keyed on `effective_python`, never `requested_python`: on the
@@ -136,6 +137,10 @@ def cache_identity(requirements: list[str], params: ResolvedParams) -> dict:
     """
     return {
         "requirements": sorted(requirements),
+        # Constraints change which versions resolve (measured: `requests` with
+        # `urllib3<1.0` resolves to requests==2.15.1, not the latest), so two
+        # runs differing only by constraints are NOT the same probe.
+        "constraints": sorted(constraints or []),
         "python_version": params.effective_python,
         "backend": params.backend,
         "compat_check_version": __version__,

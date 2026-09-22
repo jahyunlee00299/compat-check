@@ -9,14 +9,15 @@ import argparse
 import sys
 
 from compat_check.cache import cached_probe_all
-from compat_check.fetcher import FetchError, fetch_requirements
+from compat_check.fetcher import FetchError, fetch_requirements_detailed
 from compat_check.params import ParamError, validate_python_version
 from compat_check.render import render_tree
 from compat_check.runner import probe_all
 from compat_check.tree import build_tree
 
 
-def _print_report(source: str, requirements: list[str], result: dict) -> None:
+def _print_report(source: str, requirements: list[str], result: dict,
+                   fetched=None) -> None:
     cache_note = " (cached)" if result.get("cache_hit") else ""
     print(f"compat-check: {source}{cache_note}")
     print(f"backend: {result['backend']}")
@@ -32,8 +33,18 @@ def _print_report(source: str, requirements: list[str], result: dict) -> None:
             print(f"python: {params.effective_python}")
         for warning in params.warnings:
             print(f"  warning: {warning}", file=sys.stderr)
+    if fetched is not None and fetched.source_file:
+        print(f"source file: {fetched.source_file}")
     print(f"requirements checked: {', '.join(requirements)}")
+    if fetched is not None and fetched.constraints:
+        # Constraints bound the resolution without being installed. Saying so
+        # explains why a version differs from what a bare probe would pick.
+        print(f"constraints applied: {len(fetched.constraints)} "
+              f"(from -c files; they pin versions without requesting install)")
     print()
+    if fetched is not None:
+        for note in fetched.skipped:
+            print(f"  note: {note}", file=sys.stderr)
 
     if result["ok"]:
         print(f"OK — {len(result['resolved'])} package(s) would install cleanly:")
@@ -74,18 +85,23 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     try:
-        requirements = fetch_requirements(args.source)
+        fetched = fetch_requirements_detailed(args.source)
     except FetchError as e:
         print(f"compat-check: could not resolve requirements for '{args.source}': {e}", file=sys.stderr)
         return 2
 
+    requirements = fetched.requirements
+    constraints = fetched.constraints
+
     if args.no_cache:
-        result = probe_all(requirements, python_version=args.python_version)
+        result = probe_all(requirements, python_version=args.python_version,
+                            constraints=constraints)
         result = {**result, "cache_hit": False}
     else:
-        result = cached_probe_all(requirements, python_version=args.python_version)
+        result = cached_probe_all(requirements, python_version=args.python_version,
+                                   constraints=constraints)
 
-    _print_report(args.source, requirements, result)
+    _print_report(args.source, requirements, result, fetched)
 
     if args.tree:
         print()

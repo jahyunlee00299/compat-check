@@ -6,4 +6,4 @@ installed metadata and the cache key can never disagree about which version
 computed a cached answer.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -55,9 +55,11 @@ class ResolvedRequirements:
     constraints: list[str] = field(default_factory=list)
     files_read: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
-    #: ``-e`` targets that name a directory in this repo, for the caller to
-    #: resolve through the normal candidate-file search.
-    local_editables: list[str] = field(default_factory=list)
+    #: ``-e`` targets naming a directory in this repo, as
+    #: ``(path, extras)`` — e.g. ``-e .[pg,redshift]`` -> ``(".", ["pg",
+    #: "redshift"])``. The extras select optional dependency groups the caller
+    #: must resolve too: records' ``[pg]`` really does require psycopg2-binary.
+    local_editables: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
 def _normalize(base_file: str, target: str) -> str:
@@ -71,14 +73,19 @@ def _normalize(base_file: str, target: str) -> str:
     return posixpath.normpath(posixpath.join(base_dir, target)) if base_dir else posixpath.normpath(target)
 
 
-def _strip_extras(target: str) -> str:
-    """``.[pg]`` -> ``.`` — the extras select optional dependency groups, they
-    are not part of the path. Left in place, the caller would look for
-    ``.[pg]/pyproject.toml``.
+def _split_extras(target: str) -> tuple[str, list[str]]:
+    """``.[pg,redshift]`` -> ``(".", ["pg", "redshift"])``.
+
+    The extras are not part of the path: left in place the caller would look
+    for ``.[pg]/pyproject.toml``. They are not discardable either — they
+    select real requirements.
     """
     if target.endswith("]") and "[" in target:
-        return target[: target.rindex("[")]
-    return target
+        path = target[: target.rindex("[")]
+        inside = target[target.rindex("[") + 1 : -1]
+        extras = [e.strip() for e in inside.split(",") if e.strip()]
+        return path, extras
+    return target, []
 
 
 def _is_local_editable(target: str) -> bool:
@@ -137,18 +144,8 @@ def resolve_includes(
 
         for target in parsed.editables:
             if _is_local_editable(target):
-                stripped = _strip_extras(target)
-                out.local_editables.append(_normalize(path, stripped))
-                if stripped != target:
-                    # e.g. `-e .[pg]` also pulls extras_require["pg"], which
-                    # this tool does not read (consistent with skipping
-                    # pyproject's optional-dependencies). Say so rather than
-                    # returning a quietly short list.
-                    extras = target[len(stripped):]
-                    out.skipped.append(
-                        f"{path}: -e {target}  (extras {extras} not resolved; "
-                        f"only the base dependencies of {stripped} are checked)"
-                    )
+                stripped, extras = _split_extras(target)
+                out.local_editables.append((_normalize(path, stripped), extras))
             else:
                 # A different project entirely. Following it would probe the
                 # wrong repo; ignoring it silently would under-report. Say so.

@@ -31,15 +31,30 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from compat_check.includes import IncludeError, resolve_includes
 from compat_check.reqline import parse_lines
-from compat_check.setuppy import SetupPyError, parse_setup_py
+from compat_check.setuppy import SetupPyError, parse_extras_require, parse_setup_py
 
 
 class FetchError(Exception):
     """Raised when a source could not be resolved to any requirements."""
+
+
+@dataclass
+class FetchResult:
+    """Requirements plus the context needed to probe them correctly.
+
+    `fetch_requirements()` still returns a plain list so no caller breaks, but
+    constraints CHANGE the resolution (measured: `requests` under
+    `urllib3<1.0` resolves to requests==2.15.1), so anything that actually
+    runs a probe needs this richer form.
+    """
+    requirements: list[str]
+    constraints: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    source_file: str | None = None
 
 
 @dataclass
@@ -81,6 +96,11 @@ _USER_AGENT = "compat-check/0.1 (+https://github.com/)"
 _REQUEST_TIMEOUT = 15
 
 
+def _remember(key: str, lookup: "RepoLookup") -> "RepoLookup":
+    _BRANCH_CACHE[key] = lookup
+    return lookup
+
+
 class RepoLookup:
     """Outcome of asking the GitHub API about a repo.
 
@@ -95,6 +115,14 @@ class RepoLookup:
         self.problem = problem
 
 
+#: Branch lookups within one process, keyed owner/repo. A repo's default
+#: branch does not change mid-run, and the unauthenticated API budget is 60
+#: requests/hour (measured), so repeating the call is pure waste. Deliberately
+#: process-local and unbounded: a single CLI run touches a handful of repos,
+#: and persisting it would need invalidation for a branch that was renamed.
+_BRANCH_CACHE: dict[str, RepoLookup] = {}
+
+
 def _lookup_repo(ref: GitHubRef) -> RepoLookup:
     """Resolve the default branch, and diagnose the failure when there isn't one.
 
@@ -103,28 +131,35 @@ def _lookup_repo(ref: GitHubRef) -> RepoLookup:
     tool's own repo, which defaults to master), and collapsed several distinct
     failures into one indistinguishable FetchError.
     """
+    key = f"{ref.owner}/{ref.repo}"
+    cached = _BRANCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     url = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            return RepoLookup(default_branch=data.get("default_branch"))
+            return _remember(key, RepoLookup(default_branch=data.get("default_branch")))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             # GitHub deliberately returns 404 for a private repo as well as a
             # missing one, so it does not leak which private repos exist.
             # Verified: github/github and a made-up name both return 404.
-            return RepoLookup(problem=(
+            return _remember(key, RepoLookup(problem=(
                 f"GitHub has no public repository {ref.owner}/{ref.repo}. "
                 f"It either does not exist or is private — GitHub returns the "
                 f"same 404 for both, so this tool cannot tell them apart. "
                 f"Private repositories are not supported."
-            ))
+            )))
         if e.code == 403 and e.headers.get("X-RateLimit-Remaining") == "0":
             reset = e.headers.get("X-RateLimit-Reset", "")
             when = ""
             if reset.isdigit():
                 when = f" (resets at {time.strftime('%H:%M:%S', time.localtime(int(reset)))})"
+            # Not remembered: the limit resets, and a later run in the same
+            # process should be allowed to try again.
             return RepoLookup(problem=(
                 f"GitHub API rate limit exhausted{when}. compat-check makes "
                 f"unauthenticated requests, which are limited to 60 per hour."
@@ -231,7 +266,39 @@ def _repo_file_resolver(ref: GitHubRef, branch: str):
     return resolve
 
 
-def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: str) -> list[str]:
+def _resolve_extras(candidate: str, text: str, extras: list[str],
+                     label: str) -> tuple[list[str], str | None]:
+    """Requirements selected by `-e .[extra]`, or a note saying why not.
+
+    `-e .[pg]` really does require what the extra lists (records' `pg` is
+    psycopg2-binary), so resolving only the base dependencies checks a smaller
+    set than the project asked for. Where the extras cannot be read, the gap is
+    stated rather than left silent.
+    """
+    try:
+        if candidate == "setup.py":
+            return parse_extras_require(text, extras), None
+        if candidate == "pyproject.toml":
+            data = tomllib.loads(text)
+            optional = data.get("project", {}).get("optional-dependencies", {})
+            missing = [e for e in extras if e not in optional]
+            if missing:
+                return [], (f"-e {label}: extras {missing} are not declared in "
+                            f"pyproject.toml optional-dependencies")
+            out = []
+            for extra in extras:
+                out.extend(optional[extra])
+            return out, None
+    except SetupPyError as e:
+        return [], f"-e {label}: extras not resolved — {e}"
+    except Exception as e:
+        return [], f"-e {label}: extras not resolved — {e}"
+    return [], (f"-e {label}: extras cannot be read from {candidate}; only the "
+                f"base dependencies of {label.split('[')[0]} are checked")
+
+
+def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str,
+                             text: str) -> FetchResult:
     """Parse requirements.txt AND follow every -r/-c/-e it references.
 
     Without this, a file whose real content is `-r base.txt` returned only the
@@ -240,14 +307,15 @@ def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: st
     """
     resolved = resolve_includes(filename, text, _repo_file_resolver(ref, branch))
     # resolved.constraints are pins, not things to install — a constraint says
-    # "IF this package is pulled in, use this version". Merging them would turn
-    # every pin into a requirement (measured on home-assistant/core: 51 real
-    # requirements would have become 181). They are deliberately not returned.
+    # "IF this package is pulled in, use this version". They are kept OUT of
+    # the requirement list (merging them took home-assistant/core from 51 to
+    # 181) but carried alongside it, because they still bound the resolution.
 
     # `-e .` and `-e ./pkg` name a package in this same repo; its real
     # dependencies live in that directory's own pyproject/setup.cfg.
-    for target in resolved.local_editables:
+    for target, extras in resolved.local_editables:
         prefix = "" if target in (".", "") else f"{target.rstrip('/')}/"
+        label = f"{target}[{','.join(extras)}]" if extras else target
         # setup.py included: records/records is exactly this shape — a
         # requirements.txt of "-e .[pg]" plus a setup.py and nothing else.
         # Without it the real dependencies were invisible and only the one
@@ -266,7 +334,13 @@ def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: st
                 # later one might be. Only if none works do we lose the deps.
                 continue
             except Exception as e:
-                raise FetchError(f"failed to parse {prefix}{candidate} for -e {target}: {e}") from e
+                raise FetchError(f"failed to parse {prefix}{candidate} for -e {label}: {e}") from e
+
+            if extras:
+                extra_reqs, note = _resolve_extras(candidate, sub, extras, label)
+                resolved.requirements.extend(extra_reqs)
+                if note:
+                    resolved.skipped.append(note)
             break
 
     seen: set[str] = set()
@@ -275,10 +349,15 @@ def _fetch_requirements_txt(ref: GitHubRef, branch: str, filename: str, text: st
         if req not in seen:
             seen.add(req)
             deduped.append(req)
-    return deduped
+    return FetchResult(
+        requirements=deduped,
+        constraints=list(resolved.constraints),
+        skipped=list(resolved.skipped),
+        source_file=filename,
+    )
 
 
-def _fetch_from_github(ref: GitHubRef) -> list[str]:
+def _fetch_from_github(ref: GitHubRef) -> FetchResult:
     if ref.branch:
         branches = [ref.branch]
         lookup = RepoLookup()
@@ -306,9 +385,11 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
                 continue
             try:
                 if filename == "requirements.txt":
-                    reqs = _fetch_requirements_txt(ref, branch, filename, text)
+                    found = _fetch_requirements_txt(ref, branch, filename, text)
                 else:
-                    reqs = _PARSERS[filename](text)
+                    found = FetchResult(
+                        requirements=_PARSERS[filename](text), source_file=filename,
+                    )
             except SetupPyError as e:
                 # Not fatal on its own: this is the last candidate, and the
                 # repo may simply compute its requirements. Remember why, so
@@ -322,8 +403,8 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
                 raise FetchError(f"{url}: {e}") from e
             except Exception as e:
                 raise FetchError(f"failed to parse {url}: {e}") from e
-            if reqs:
-                return reqs
+            if found.requirements:
+                return found
             # file exists but declares no dependencies — keep searching other files/branches
     branch_note = (
         f" on branch {branches[0]}" if len(branches) == 1
@@ -341,7 +422,7 @@ def _fetch_from_github(ref: GitHubRef) -> list[str]:
     )
 
 
-def _fetch_from_pypi(package_name: str) -> list[str]:
+def _fetch_from_pypi(package_name: str) -> FetchResult:
     url = f"https://pypi.org/pypi/{package_name}/json"
     text = _http_get(url)
     if text is None:
@@ -352,7 +433,27 @@ def _fetch_from_pypi(package_name: str) -> list[str]:
     base = [r for r in requires_dist if "extra ==" not in r]
     if not base:
         raise FetchError(f"PyPI package {package_name} declares no base requires_dist")
-    return base
+    return FetchResult(requirements=base, source_file="PyPI requires_dist")
+
+
+def fetch_requirements_detailed(source: str) -> FetchResult:
+    """Resolve `source` to requirements plus the constraints that bound them.
+
+    Callers that actually run a probe want this: constraints change which
+    versions resolve, so dropping them checks a different version set than the
+    project itself would install.
+    """
+    ref = parse_github_url(source)
+    if ref is not None:
+        return _fetch_from_github(ref)
+    if looks_like_github(source):
+        raise FetchError(
+            f"{source!r} looks like a GitHub reference but could not be parsed. "
+            f"Expected forms: https://github.com/<owner>/<repo>, "
+            f"github.com/<owner>/<repo>, git@github.com:<owner>/<repo>.git, "
+            f"optionally with /tree/<branch>."
+        )
+    return _fetch_from_pypi(source)
 
 
 def fetch_requirements(source: str) -> list[str]:
@@ -363,17 +464,4 @@ def fetch_requirements(source: str) -> list[str]:
     "no requirements, trivially ok", which this function must not be
     confused with.
     """
-    ref = parse_github_url(source)
-    if ref is not None:
-        return _fetch_from_github(ref)
-    if looks_like_github(source):
-        # Do not fall through to PyPI: the user clearly meant GitHub, and a
-        # "PyPI package not found" message would send them looking in the
-        # wrong place entirely.
-        raise FetchError(
-            f"{source!r} looks like a GitHub reference but could not be parsed. "
-            f"Expected forms: https://github.com/<owner>/<repo>, "
-            f"github.com/<owner>/<repo>, git@github.com:<owner>/<repo>.git, "
-            f"optionally with /tree/<branch>."
-        )
-    return _fetch_from_pypi(source)
+    return fetch_requirements_detailed(source).requirements

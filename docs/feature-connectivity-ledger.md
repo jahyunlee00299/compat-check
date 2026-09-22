@@ -654,3 +654,91 @@
   - A `setup.cfg` that exists but declares no `install_requires` returns `[]`
     and the search moves on to `setup.py`; a `setup.cfg` with a *broken*
     `install_requires` still raises immediately rather than falling through.
+
+## unit: constraints applied, extras resolved, branch lookup cached (0.5.0)
+
+Closes the four risks the 0.4.0 ledger left open. Each was measured before
+being fixed; one measurement changed what the fix had to be.
+
+### 1. `-c` constraints now reach the resolver
+
+- **The risk as logged**: constraints were collected but never applied, so a
+  dry-run could succeed on a version combination the project itself rejects.
+- **Measured**: `uv pip compile requests --constraint 'urllib3<1.0'` resolves
+  to **requests==2.15.1**, where an unconstrained resolve gives the current
+  release. So the effect is not "a conflict we miss" — it is **a different
+  version set checked than the one the project installs**.
+- **A prediction of mine that the measurement refuted**: I expected an
+  impossible constraint to turn a clean resolve into a conflict. It does not;
+  the resolver walks *backwards* to a release old enough to satisfy it and
+  exits 0. Had the fix been justified as "catch conflicts we miss", it would
+  have been justified by something that does not happen.
+- **Change**: `_Backend.dry_run_install()` takes an optional constraint file;
+  both backends pass `--constraint` (verified both accept it).
+  `probe_once()`/`probe_all()` take `constraints` and write a temp file inside
+  the venv's own `TemporaryDirectory`. `cache_identity()` includes sorted
+  constraints — two runs differing only by constraints are **not** the same
+  probe, and the cache must not conflate them.
+- **Refute**: `probe_all(['requests'])` and the same with
+  `constraints=['urllib3<1.0']` resolve to different `requests==` versions;
+  `constraints=[]` is byte-identical to `constraints=None`; cache keys differ
+  with constraints and are order-independent.
+
+### 2. `-e .[pg]` extras are resolved, not just reported
+
+- **The risk as logged**: extras were named in a skip note but not read, so
+  `-e .[pg]` checked only base dependencies.
+- **Measured**: records' `extras_require` is
+  `{'pandas': ['tablib[pandas]'], 'pg': ['psycopg2-binary'], 'redshift': [...]}`
+  — `psycopg2-binary` is a real requirement we were omitting.
+- **Change**: `_split_extras()` replaces `_strip_extras()`, so
+  `local_editables` carries `(path, extras)` instead of discarding the groups.
+  `setuppy.parse_extras_require()` reads `extras_require` by AST (same
+  no-execution rule as `install_requires`); pyproject's
+  `optional-dependencies` is read for the same purpose. An extra that is
+  undeclared or computed at runtime raises, and the caller records a stated
+  gap rather than returning a short list.
+- **Refute**: records now resolves **6** requirements including
+  `psycopg2-binary` (was 5, was 1 before Unit 2) and emits **no** skip note,
+  because the gap is closed rather than described. An undeclared extra raises
+  naming what *is* declared; a computed `extras_require` raises.
+
+### 3. Branch lookup is cached per process
+
+- **Measured**: three CLI runs cost three API requests against a 60/hour
+  budget, because `cli.main()` calls the fetcher before consulting the probe
+  cache.
+- **Change**: `_BRANCH_CACHE`, process-local, keyed `owner/repo`. Successful
+  lookups **and** 404 diagnoses are memoized; a **rate-limit 403 deliberately
+  is not**, because the limit resets and a later call in the same process
+  must be allowed to retry.
+- **Refute**: three `_lookup_repo()` calls make one `urlopen`; a 404 likewise;
+  a rate-limited 403 makes three, proving the exception is real and not an
+  oversight.
+- **Scope note**: this fixes repetition *within* a run. Two separate CLI
+  invocations still cost one request each — persisting it would need
+  invalidation for a renamed branch, which is a larger design.
+
+### 4. `FetchResult` replaces the bare list internally
+
+Constraints and skip notes cannot travel in a `list[str]`.
+`fetch_requirements_detailed()` returns `FetchResult(requirements,
+constraints, skipped, source_file)`; `fetch_requirements()` keeps its exact
+signature and delegates, so no external caller breaks. The CLI uses the
+detailed form to print the source file, the constraint count, and any skip
+notes to stderr.
+
+- **Regress**: 131/131 across 14 modules, 0 failures (was 112/112 across 13).
+  Three pre-existing CLI tests referenced `cli.fetch_requirements` and were
+  updated to the new symbol — a real signature change inside the module, not
+  a test worked around.
+- **Deferred risk**:
+  - Constraints are applied but never reported per-package: if a resolved
+    version differs *because of* a constraint, the report shows the version
+    without attributing it to the constraint.
+  - `_BRANCH_CACHE` is unbounded. A single CLI run touches a handful of repos,
+    so this is bounded in practice, but a long-lived library user importing
+    the module would accumulate entries.
+  - pyproject `optional-dependencies` are read only for an explicit `-e .[x]`;
+    a bare `-e .` still resolves base dependencies only, which is correct but
+    means the two paths read different parts of the same file.

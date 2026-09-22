@@ -169,7 +169,14 @@ answer computed by an older build.
    `-c` constraint files are read but kept separate — a constraint pins a
    package *if* something pulls it in, so treating those entries as
    requirements would inflate the same repo to 181 packages it never asked
-   to install.
+   to install. They are then passed to the resolver as `--constraint`, the
+   way pip and uv mean them: resolving `requests` under `urllib3<1.0` really
+   does yield `requests==2.15.1` rather than the latest, so ignoring the file
+   would check a different version set than the project installs.
+
+   An editable install with extras (`-e .[pg]`) resolves those extras too —
+   records' `pg` group genuinely requires `psycopg2-binary`. Where an extra
+   cannot be read statically, the gap is reported rather than left silent.
 2. Create a disposable virtual environment.
 3. Run `pip install --dry-run` (or `uv pip install --dry-run`) against it —
    this resolves and would-download, but never actually installs anything
