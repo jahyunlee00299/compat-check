@@ -62,6 +62,21 @@ from metadata.
 - `setup.py`-only packages with no `pyproject.toml`/`requirements.txt`/
   `setup.cfg` (would require unsafe code execution to parse reliably)
 
+It also does not look *inside* the code once it installs. A package that
+resolves cleanly can still carry a measured constant nobody sourced, or an
+index pointing at a file that is gone. [fiducial][fid] asks that question, with
+the same three exit codes and after the same failure: a check that reports
+success because it checked nothing. Here that shape is a fail-fast resolver
+hiding the second broken requirement behind the first; there it was a scanner
+whose path globs had gone stale printing `OK — no violations across 0 file(s)`.
+
+The two are separate packages, neither depending on the other, and they hold at
+different moments — this one once when you adopt a dependency, that one on
+every commit. [fiducial's FOUR_AXES.md][axes] lays out the whole arrangement.
+
+[fid]: https://github.com/jahyunlee00299/fiducial
+[axes]: https://github.com/jahyunlee00299/fiducial/blob/main/docs/FOUR_AXES.md
+
 ## Install
 
 Not yet published to PyPI — install directly from the repo:
