@@ -136,3 +136,28 @@ if __name__ == "__main__":
         t()
         print(f"  PASS  {t.__name__}")
     print(f"\nall {len(tests)} setup.py tests passed")
+
+
+def test_module_level_augmented_assignment_is_not_a_partial_list():
+    """`REQS += [...]` after the first binding: returning ['a'] would drop 'b'.
+
+    Found by the replay of the setup.py unit: both independent re-implementations
+    refused this shape, while the shipped parser silently kept the stale list.
+    """
+    src = (
+        "from setuptools import setup\n"
+        "REQS = ['a']\n"
+        "REQS += ['b']\n"
+        "setup(install_requires=REQS)\n"
+    )
+    try:
+        parse_setup_py(src)
+    except SetupPyError as e:
+        assert "computed at runtime" in str(e)
+    else:
+        raise AssertionError("expected SetupPyError for an augmented assignment")
+
+
+def test_plain_rebinding_still_takes_the_last_value():
+    src = "from setuptools import setup\nREQS = ['a']\nREQS = ['b']\nsetup(install_requires=REQS)\n"
+    assert parse_setup_py(src) == ["b"]

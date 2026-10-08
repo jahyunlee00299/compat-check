@@ -55,6 +55,16 @@ def _module_level_bindings(tree: ast.Module) -> dict[str, ast.expr]:
         elif isinstance(statement, ast.AnnAssign) and statement.value:
             if isinstance(statement.target, ast.Name):
                 bindings[statement.target.id] = statement.value
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
+            # `REQS += [...]` changes the value after the first assignment.
+            # Keeping the earlier literal would return a partial list, which
+            # this module promises never to do; a BinOp is not literal_eval-able
+            # for lists, so the caller reports it as computed at runtime.
+            previous = bindings.get(statement.target.id)
+            if previous is not None:
+                bindings[statement.target.id] = ast.BinOp(
+                    left=previous, op=statement.op, right=statement.value
+                )
     return bindings
 
 
