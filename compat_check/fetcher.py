@@ -15,7 +15,8 @@ followed by includes.py, so the returned list is complete or the call raises.
 Measured on home-assistant/core: 47 requirements before following includes,
 181 after — the earlier code silently reported the 47 as the whole set.
 
-PyPI path reads info.requires_dist from the package's JSON API.
+PyPI path probes the package itself plus info.requires_dist from its JSON API
+(`name` or `name==version`).
 
 fetch_requirements() distinguishes "found nothing" from "found an empty
 list" by raising FetchError instead of ever returning []. Callers must not
@@ -427,9 +428,25 @@ _PYPI_PIN = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([A-Za-z0-9][A-
 # any other version operator: rejected with a pointer to the supported form, never sent to PyPI
 # as a package name (that produced "PyPI package not found: thermosteam>=0.53").
 _PYPI_OTHER_SPEC = re.compile(r"[<>=!~;\[@ ]")
+_PYPI_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_EXTRA_MARKER_RE = re.compile(r"extra\s*==")
 
 
 def _fetch_from_pypi(source: str) -> FetchResult:
+    """Requirements for a PyPI source: the package itself, then its requires_dist.
+
+    The package itself is part of the probe. Resolving only `requires_dist`
+    checks everything the package pulls in but never the package: measured on
+    2026-10-11 (Python 3.15.0rc3), `compat-check torch --python 3.15` printed
+    OK while `uv pip install --dry-run torch` failed with "all versions of
+    torch have no wheels with a matching Python ABI tag". openmm behaved the
+    same. It also made packages whose requires_dist is empty (gemmi,
+    xlsxwriter, propka) unanswerable — they were reported as BLIND although
+    the package itself is exactly what the user wants checked.
+
+    `name==version` pins the probe (and reads that release's requires_dist);
+    a bare name probes the latest release. Other specifiers are rejected.
+    """
     pin = _PYPI_PIN.match(source)
     if pin is None and _PYPI_OTHER_SPEC.search(source.strip()):
         raise FetchError(
@@ -437,6 +454,8 @@ def _fetch_from_pypi(source: str) -> FetchResult:
             f"for PyPI sources")
     if pin is None:
         package_name, version = source.strip(), None
+        if _PYPI_NAME.match(package_name) is None:
+            raise FetchError(f"not a valid PyPI package name: {source!r}")
         url = f"https://pypi.org/pypi/{package_name}/json"
     else:
         package_name, version = pin.groups()
@@ -446,18 +465,14 @@ def _fetch_from_pypi(source: str) -> FetchResult:
         if version is None or _http_get(f"https://pypi.org/pypi/{package_name}/json") is None:
             raise FetchError(f"PyPI package not found: {package_name}")
         raise FetchError(f"PyPI package {package_name} has no release {version}")
-    data = json.loads(text)
-    requires_dist = data.get("info", {}).get("requires_dist") or []
+    info = json.loads(text).get("info", {})
+    requires_dist = info.get("requires_dist") or []
     # drop extras-only markers (e.g. 'foo; extra == "dev"') — base install only.
-    base = [r for r in requires_dist if "extra ==" not in r]
-    label = package_name if version is None else f"{package_name}=={version}"
-    if version is not None:
-        # the pin itself goes first: a release with no wheel/sdist for this Python or platform is
-        #   exactly the failure a pinned check exists to catch, and its deps alone cannot show it.
-        base = [label] + base
-    if not base:
-        raise FetchError(f"PyPI package {label} declares no base requires_dist")
-    return FetchResult(requirements=base, source_file=f"PyPI requires_dist ({label})")
+    base = [r for r in requires_dist if not _EXTRA_MARKER_RE.search(r)]
+    canonical = info.get("name") or package_name
+    self_spec = canonical if version is None else f"{canonical}=={version}"
+    return FetchResult(requirements=[self_spec, *base],
+                       source_file=f"PyPI (the package itself + requires_dist) ({self_spec})")
 
 
 def fetch_requirements_detailed(source: str) -> FetchResult:
