@@ -93,6 +93,17 @@ _GITHUB_FORMS = (_GITHUB_URL_RE, _GITHUB_BARE_RE, _GITHUB_SSH_RE)
 # unreadable (a computed install_requires).
 _CANDIDATE_FILES = ("pyproject.toml", "requirements.txt", "setup.cfg", "setup.py")
 _BRANCH_FALLBACKS = ("main", "master")
+
+#: Appended to every "found no dependencies" error. The lookup reads the four
+#: root-level declaration files only. sci-toolkit keeps its requirements in
+#: skills/*/requirements.txt, so a root with nothing is a PARTIAL blind spot,
+#: not proof the repo has no dependencies — the message must not read as one.
+_ROOT_ONLY_NOTE = (
+    "Only files at the repository root were checked (no recursive search), so "
+    "requirements files in subdirectories (e.g. skills/*/requirements.txt, "
+    "docker/requirements.txt) were not looked at; this is a partial blind spot, "
+    "not a finding that the repository has no dependencies."
+)
 _USER_AGENT = "compat-check/0.1 (+https://github.com/)"
 _REQUEST_TIMEOUT = 15
 
@@ -415,11 +426,12 @@ def _fetch_from_github(ref: GitHubRef) -> FetchResult:
         raise FetchError(
             f"{ref.owner}/{ref.repo}{branch_note}: the only dependency "
             f"declaration is a setup.py that cannot be read statically — "
-            f"{setup_py_problem}"
+            f"{setup_py_problem}. {_ROOT_ONLY_NOTE}"
         )
     raise FetchError(
         f"no pyproject.toml/requirements.txt/setup.cfg/setup.py with dependencies "
-        f"found for {ref.owner}/{ref.repo}{branch_note} (tried: {', '.join(tried)})"
+        f"found for {ref.owner}/{ref.repo}{branch_note} (tried: {', '.join(tried)}). "
+        f"{_ROOT_ONLY_NOTE}"
     )
 
 

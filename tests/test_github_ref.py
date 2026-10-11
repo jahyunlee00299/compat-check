@@ -191,6 +191,38 @@ def test_not_found_error_names_the_branch_searched():
     raise AssertionError("should raise")
 
 
+def test_empty_root_says_only_the_root_was_checked():
+    """sci-toolkit keeps skills/*/requirements.txt below a root with no declaration.
+
+    The exit-2 message must say the BLIND is partial, not that there is nothing.
+    """
+    with mock.patch.object(fetcher, "_lookup_repo",
+                            return_value=fetcher.RepoLookup(default_branch="main")), \
+         mock.patch.object(fetcher, "_http_get", return_value=None):
+        try:
+            fetcher._fetch_from_github(GitHubRef("o", "r", None))
+        except FetchError as e:
+            msg = str(e)
+            assert "Only files at the repository root were checked" in msg, msg
+            assert "no recursive search" in msg
+            assert "skills/*/requirements.txt" in msg
+            return
+    raise AssertionError("should raise")
+
+
+def test_unreadable_setup_py_at_the_root_also_carries_the_root_only_note():
+    with mock.patch.object(fetcher, "_lookup_repo",
+                            return_value=fetcher.RepoLookup(default_branch="main")), \
+         mock.patch.object(fetcher, "_http_get",
+                            side_effect=lambda url: "from x import y\nsetup(install_requires=f())" if url.endswith("setup.py") else None):
+        try:
+            fetcher._fetch_from_github(GitHubRef("o", "r", None))
+        except FetchError as e:
+            assert "cannot be read statically" in str(e) and "no recursive search" in str(e), str(e)
+            return
+    raise AssertionError("should raise")
+
+
 def test_branch_lookup_is_cached_within_the_process():
     """A repo's default branch does not change mid-run, and the budget is 60/hour."""
     _clear_cache()
