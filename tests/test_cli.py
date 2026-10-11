@@ -173,6 +173,94 @@ def test_direct_wheel_failure_does_not_say_blocked_by_itself():
     assert "blocked by" not in out
 
 
+def _ok_result(resolved):
+    return {"ok": True, "backend": "uv", "failures": [], "resolved": resolved,
+            "cache_hit": False, "params": None}
+
+
+def _report(findings):
+    from compat_check.wheels import Target, WheelReport
+    return WheelReport(Target(python=(3, 15), system="linux", machine="x86_64"), findings)
+
+
+def _source_report():
+    from compat_check.wheels import WheelFinding
+    return _report([WheelFinding("six==1.16.0", "wheel"),
+                    WheelFinding("PyYAML==6.0.3", "source",
+                                 detail="newest wheels: cp314-cp314, cp313-cp313")])
+
+
+def _run_with_wheels(argv, report):
+    fetched = FetchResult(requirements=["PyYAML"])
+    with mock.patch("compat_check.cli.fetch_requirements_detailed", return_value=fetched), \
+         mock.patch("compat_check.cli.cached_probe_all",
+                     return_value=_ok_result(["six==1.16.0", "PyYAML==6.0.3"])), \
+         mock.patch("compat_check.cli.check_wheels", return_value=report) as chk:
+        rc, out, err = _run(argv)
+    return rc, out, err, chk
+
+
+def test_source_build_resolve_exits_zero_but_warns_prominently():
+    """The 0/1/2 contract is shared with other gates, so no new exit code."""
+    rc, out, _, _ = _run_with_wheels(["fake-src", "--python", "3.15"], _source_report())
+    assert rc == 0
+    assert "RESOLVES WITH WARNINGS" in out and "1 need a source build" in out, out
+    assert "OK —" not in out, "a source-build resolve must not read as a clean OK"
+    assert "WARN — 1 package(s) have no wheel for Python 3.15 on linux x86_64" in out
+    assert "install will build from source" in out
+    assert "! PyYAML==6.0.3" in out
+    assert "+ PyYAML==6.0.3   [source build]" in out
+    assert "--strict-wheels makes this exit 1" in out
+
+
+def test_strict_wheels_turns_the_warning_into_exit_one():
+    rc, out, _, _ = _run_with_wheels(["fake-src", "--strict-wheels"], _source_report())
+    assert rc == 1
+    assert "RESOLVES WITH WARNINGS" in out
+    assert "result: FAIL (--strict-wheels)" in out
+    assert "exit 0" not in out, "the report must not claim exit 0 while exiting 1"
+
+
+def test_unknown_wheel_status_is_a_warning_and_strict_failure():
+    from compat_check.wheels import WheelFinding
+    report = _report([WheelFinding("ghost==1.0", "unknown", detail="network error: down")])
+    rc, out, _, _ = _run_with_wheels(["fake-src"], report)
+    assert rc == 0
+    assert "unknown wheel status" in out and "? ghost==1.0" in out
+    rc_strict, _, _, _ = _run_with_wheels(["fake-src", "--strict-wheels"], report)
+    assert rc_strict == 1
+
+
+def test_clean_wheels_keep_the_plain_ok_and_exit_zero_even_when_strict():
+    from compat_check.wheels import WheelFinding
+    report = _report([WheelFinding("six==1.16.0", "wheel")])
+    rc, out, _, _ = _run_with_wheels(["fake-src", "--strict-wheels"], report)
+    assert rc == 0
+    assert "OK — 2 package(s) would install cleanly" in out
+    assert "wheels: all 1 PyPI package(s) have a wheel" in out
+
+
+def test_no_wheel_check_skips_the_lookup():
+    rc, out, _, chk = _run_with_wheels(["fake-src", "--no-wheel-check"], _source_report())
+    assert rc == 0
+    assert chk.call_count == 0
+    assert "OK —" in out
+
+
+def test_wheel_check_targets_the_python_actually_probed():
+    _, _, _, chk = _run_with_wheels(["fake-src", "--python", "3.15"], _source_report())
+    resolved, target = chk.call_args.args
+    assert target.python == (3, 15)
+
+
+def test_wheel_check_is_not_run_when_the_resolve_failed():
+    with mock.patch("compat_check.cli.fetch_requirements_detailed",
+                     return_value=FetchResult(requirements=["numpy>=2.0", "numpy<1.20"])), \
+         mock.patch("compat_check.cli.check_wheels") as chk:
+        rc, _, _ = _run(["fake-conflict", "--no-cache"])
+    assert rc == 1 and chk.call_count == 0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

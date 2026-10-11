@@ -2,6 +2,10 @@
 human-readable report.
 
     compat-check <github-url-or-pypi-name> [--python 3.11] [--no-cache]
+                 [--strict-wheels] [--no-wheel-check]
+
+Exit codes: 0 clean (or resolves with wheel WARNINGs, see --strict-wheels),
+1 conflicts found, 2 source could not be resolved (BLIND), 3 invalid parameter.
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from compat_check.params import ParamError, validate_python_version
 from compat_check.render import render_tree
 from compat_check.runner import normalize_name, probe_all
 from compat_check.tree import build_tree
+from compat_check.wheels import WheelReport, check_wheels, format_report, host_target
 
 
 def _describe_blocker(failure: dict) -> str:
@@ -31,7 +36,8 @@ def _describe_blocker(failure: dict) -> str:
 
 
 def _print_report(source: str, requirements: list[str], result: dict,
-                   fetched=None) -> None:
+                   fetched=None, wheels: WheelReport | None = None,
+                   strict_wheels: bool = False) -> None:
     cache_note = " (cached)" if result.get("cache_hit") else ""
     print(f"compat-check: {source}{cache_note}")
     print(f"backend: {result['backend']}")
@@ -61,9 +67,31 @@ def _print_report(source: str, requirements: list[str], result: dict,
             print(f"  note: {note}", file=sys.stderr)
 
     if result["ok"]:
-        print(f"OK — {len(result['resolved'])} package(s) would install cleanly:")
+        if wheels is not None and wheels.needs_attention:
+            # Resolvable is not the same as installable from wheels: say so in
+            # the headline, not only in a section below the package list.
+            print(f"RESOLVES WITH WARNINGS — {len(result['resolved'])} package(s) "
+                  f"resolve, but {len(wheels.source_builds)} need a source build"
+                  + (f" and {len(wheels.unknown)} have unknown wheel status"
+                     if wheels.unknown else "") + ":")
+        else:
+            print(f"OK — {len(result['resolved'])} package(s) would install cleanly:")
         for pkg in result["resolved"]:
-            print(f"  + {pkg}")
+            flag = wheels.flag_for(pkg) if wheels is not None else ""
+            print(f"  + {pkg}" + (f"   [{flag}]" if flag else ""))
+        if wheels is not None:
+            lines = format_report(wheels)
+            if lines:
+                print()
+                for line in lines:
+                    print(line)
+            if wheels.needs_attention:
+                if strict_wheels:
+                    print("\nresult: FAIL (--strict-wheels) — resolves, but not everything "
+                          "installs from wheels (exit 1)")
+                else:
+                    print("\nresult: WARN — resolves, but not everything installs from wheels "
+                          "(exit 0; --strict-wheels makes this exit 1)")
         return
 
     if result.get("truncated"):
@@ -96,6 +124,13 @@ def main(argv: list[str] | None = None) -> int:
                               "backend cannot honour this and will say so explicitly.")
     parser.add_argument("--no-cache", action="store_true",
                          help="skip the local failure-history cache, always probe fresh")
+    parser.add_argument("--strict-wheels", action="store_true",
+                         help="exit 1 when the resolve succeeds but a package would be built "
+                              "from source (no wheel for the target Python on this platform) "
+                              "or its wheel status could not be determined")
+    parser.add_argument("--no-wheel-check", action="store_true",
+                         help="skip the post-resolve wheel check (it makes one PyPI request "
+                              "per resolved package)")
     parser.add_argument("--tree", action="store_true",
                          help="show the full dependency tree (requires uv; no pip fallback)")
     args = parser.parse_args(argv)
@@ -125,7 +160,14 @@ def main(argv: list[str] | None = None) -> int:
         result = cached_probe_all(requirements, python_version=args.python_version,
                                    constraints=constraints)
 
-    _print_report(args.source, requirements, result, fetched)
+    wheels = None
+    if result["ok"] and result["resolved"] and not args.no_wheel_check:
+        params = result.get("params")
+        python = params.effective_python if params is not None else args.python_version
+        wheels = check_wheels(result["resolved"], host_target(python))
+
+    _print_report(args.source, requirements, result, fetched, wheels,
+                  strict_wheels=args.strict_wheels)
 
     if args.tree:
         print()
@@ -138,7 +180,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"(tree unavailable: {tree_result['stderr'].strip()})", file=sys.stderr)
 
-    return 0 if result["ok"] else 1
+    if not result["ok"]:
+        return 1
+    # Exit-code contract shared with the other gates is 0 / 1 / 2 (2 = BLIND):
+    # "resolves but needs a source build" gets no code of its own. It stays 0
+    # with a prominent WARN, and --strict-wheels promotes it to 1.
+    if args.strict_wheels and wheels is not None and wheels.needs_attention:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
