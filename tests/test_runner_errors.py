@@ -21,6 +21,7 @@ from compat_check.runner import (
     _UvBackend,
     _drops,
     _requirement_name,
+    normalize_name,
     probe_all,
 )
 
@@ -87,6 +88,165 @@ def test_drops_matches_whole_names_not_prefixes():
     assert _drops("xyz10", "xyz1") is False
     assert _drops("xyz19>=2", "xyz1") is False
     assert _drops("charset_normalizer<4", "charset-normalizer") is True
+
+
+# --- Transitive wheel gaps, captured from `uv 0.12.24` against Python 3.15.0rc3
+# on 2026-10-11 (uv pip install --dry-run). The failing package used to come
+# back <unknown> for botorch/torchdiffeq, which stopped probe_all()'s retry loop.
+
+# A package whose own requirement is the blocker.
+_ABI_DIRECT = """\
+error: No solution found when resolving dependencies
+  cause: Because all versions of torch have no wheels with a matching Python ABI tag (e.g., `cp315`) and you require torch, we can conclude that your requirements are unsatisfiable.
+
+hint: You require CPython 3.15 (`cp315`), but we only found wheels for `torch` (v2.14.1) with the following Python ABI tags: `cp310`, `cp311`, `cp312`, `cp313`, `cp314`, `cp314t`
+"""
+
+# Chain: markitdown -> magika -> onnxruntime (no cp315 wheel). The root cause
+# is onnxruntime; the requirement to drop is markitdown.
+_ABI_CHAIN = """\
+error: No solution found when resolving dependencies
+  cause: Because onnxruntime>=1.17.0 has no wheels with a matching Python ABI tag (e.g., `cp315`) and magika>=0.6.1,<=0.6.3 depends on onnxruntime>=1.17.0, we can conclude that magika>=0.6.1,<=0.6.3 cannot be used.
+         And because only the following versions of magika are available:
+             magika<=0.6.3
+             magika>0.7.dev0
+         we can conclude that magika>=0.6.1,<0.7.dev0 cannot be used.
+         And because markitdown>=0.1.0 depends on magika>=0.6.1,<0.7.dev0 and you require markitdown>=0.1, we can conclude that your requirements are unsatisfiable.
+
+hint: You require CPython 3.15 (`cp315`), but we only found wheels for `onnxruntime` (v1.31.0) with the following Python ABI tags: `cp311`, `cp312`, `cp313`, `cp313t`, `cp314`, `cp314t`
+"""
+
+# botorch: the dropped requirement is the version-bounded "torch>=2.4".
+_ABI_BOUNDED = """\
+error: No solution found when resolving dependencies
+  cause: Because torch>=2.4.0 has no wheels with a matching Python ABI tag (e.g., `cp315`) and you require torch>=2.4, we can conclude that your requirements are unsatisfiable.
+
+hint: You require CPython 3.15 (`cp315`), but we only found wheels for `torch` (v2.14.1) with the following Python ABI tags: `cp310`, `cp311`, `cp312`, `cp313`, `cp314`, `cp314t`
+"""
+
+# linear-operator -> torch, with the "And because you require" continuation form.
+_ABI_AND_REQUIRE = """\
+error: No solution found when resolving dependencies
+  cause: Because torch>=2.0.0 has no wheels with a matching Python ABI tag (e.g., `cp315`) and linear-operator>=0.6.1 depends on torch>=2.0, we can conclude that linear-operator>=0.6.1 cannot be used.
+         And because you require linear-operator>=0.6.1, we can conclude that your requirements are unsatisfiable.
+
+hint: You require CPython 3.15 (`cp315`), but we only found wheels for `torch` (v2.14.1) with the following Python ABI tags: `cp310`, `cp311`, `cp312`, `cp313`, `cp314`, `cp314t`
+"""
+
+# Older uv wording: version in parentheses, no "(e.g., ...)" tag.
+_ABI_OLD_FORM = """\
+  \u00d7 No solution found when resolving dependencies:
+  \u2570\u2500\u25b6 Because onnxruntime (v1.17.0) has no wheels with a matching Python ABI tag
+      and you require onnxruntime, we can conclude that your requirements are
+      unsatisfiable.
+"""
+
+
+def test_abi_direct_requirement_is_dropped_and_is_its_own_root_cause():
+    d = _UV._extract_detail(_ABI_DIRECT)
+    assert d.candidates[0] == "torch"
+    assert d.root_package == "torch"
+    assert d.root_reason == "no cp315 wheel"
+
+
+def test_abi_chain_drops_the_direct_requirement_but_names_the_root_cause():
+    d = _UV._extract_detail(_ABI_CHAIN)
+    assert d.candidates[0] == "markitdown", d.candidates
+    assert d.root_package == "onnxruntime"
+    assert d.root_reason == "no cp315 wheel"
+    assert _UV._extract_failing_package(_ABI_CHAIN) == "markitdown"
+
+
+def test_abi_bounded_requirement_is_attributed_to_torch():
+    """botorch came back <unknown> before: the 'torch>=2.4.0' form has no (v...)."""
+    assert _UV._extract_failing_package(_ABI_BOUNDED) == "torch"
+    assert _UV._extract_detail(_ABI_BOUNDED).root_package == "torch"
+
+
+def test_and_you_require_continuation_form_drops_the_direct_requirement():
+    d = _UV._extract_detail(_ABI_AND_REQUIRE)
+    assert d.candidates[0] == "linear-operator", d.candidates
+    assert d.root_package == "torch"
+
+
+def test_old_parenthesised_wording_still_matches():
+    d = _UV._extract_detail(_ABI_OLD_FORM)
+    assert d.root_package == "onnxruntime"
+    assert d.candidates[0] == "onnxruntime"
+    # No "(e.g., `cpXYZ`)" in this wording, so the tag is not invented.
+    assert d.root_reason == "no wheels with a matching Python ABI tag"
+
+
+def test_hint_line_is_parsed_into_available_tags():
+    d = _UV._extract_detail(_ABI_CHAIN)
+    assert d.available_tags == ["cp311", "cp312", "cp313", "cp313t", "cp314", "cp314t"]
+    assert d.tags_for == "onnxruntime v1.31.0"
+    assert d.hint is not None and d.hint.startswith("You require CPython 3.15")
+
+
+def test_hint_line_is_not_mistaken_for_a_requirement():
+    """'You require CPython 3.15' must never make CPython a drop candidate."""
+    for text in (_ABI_DIRECT, _ABI_CHAIN, _ABI_BOUNDED, _ABI_AND_REQUIRE):
+        assert "CPython" not in _UV._extract_detail(text).candidates
+
+
+def test_no_hint_means_no_tags():
+    d = _UV._extract_detail(_CONFLICT)
+    assert d.hint is None and d.available_tags == []
+    assert d.root_package is None
+
+
+def test_not_found_with_a_transitive_cause_still_drops_the_direct_requirement():
+    text = (
+        "  cause: Because ghost-dep was not found in the package registry and "
+        "my-app==1.0 depends on ghost-dep, we can conclude that my-app==1.0 "
+        "cannot be used.\n         And because you require my-app==1.0, we "
+        "can conclude that your requirements are unsatisfiable.\n"
+    )
+    d = _UV._extract_detail(text)
+    assert d.candidates[:2] == ["my-app", "ghost-dep"], d.candidates
+    assert d.root_package == "ghost-dep"
+    assert d.root_reason == "not found in the package registry"
+
+
+def test_normalize_name_is_pep503():
+    assert normalize_name("Ruamel.YAML") == "ruamel-yaml"
+    assert normalize_name("charset_normalizer") == "charset-normalizer"
+    assert _drops("ruamel.yaml>=0.17", "ruamel-yaml") is True
+
+
+def test_probe_all_continues_past_a_transitive_failure():
+    """The retry loop must drop the direct requirement, not stall on the root cause.
+
+    Offline: the backend is replaced by one that replays the captured chain.
+    """
+    from unittest import mock
+    from compat_check import runner
+
+    class _Replay(_UvBackend):
+        def create_venv(self, venv_path, python_version):
+            import subprocess
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def dry_run_install(self, venv_path, requirements, constraint_file=None):
+            import subprocess
+            names = [runner._requirement_name(r) for r in requirements]
+            if "markitdown" in names:
+                return subprocess.CompletedProcess([], 1, "", _ABI_CHAIN)
+            if "torch" in names:
+                return subprocess.CompletedProcess([], 1, "", _ABI_BOUNDED)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    with mock.patch.object(runner, "_select_backend", return_value=_Replay()):
+        result = probe_all(["markitdown>=0.1", "torch>=2.4", "certifi"])
+    pkgs = [f["package"] for f in result["failures"]]
+    assert pkgs == ["markitdown", "torch"], pkgs
+    first = result["failures"][0]
+    assert first["package"] == "markitdown"
+    assert first["root_package"] == "onnxruntime"
+    assert first["available_tags"][0] == "cp311"
+    assert result["failures"][1]["root_package"] == "torch"
+    assert result["truncated"] is False
 
 
 def test_every_nonexistent_package_is_reported_not_just_the_first():

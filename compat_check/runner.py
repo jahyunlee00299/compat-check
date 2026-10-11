@@ -22,12 +22,34 @@ from compat_check.params import ResolvedParams, resolve_params
 
 
 @dataclass
+class FailureDetail:
+    """What a failed resolve says about WHY, beyond the one name to drop.
+
+    `candidates` are the names probe_all() may drop to make progress, best
+    first: the DIRECT requirements the user asked for ("you require X"),
+    followed by the package a specific diagnosis names. They are separate
+    from `root_package` because the two are different questions — measured on
+    2026-10-11 with Python 3.15.0rc3, `markitdown>=0.1` fails because its
+    dependency onnxruntime has no cp315 wheel. Dropping `onnxruntime` removes
+    nothing from the user's requirement list (the loop then stalls), while
+    reporting only `markitdown` hides the actual blocker.
+    """
+    candidates: list[str] = field(default_factory=list)
+    root_package: str | None = None
+    root_reason: str | None = None
+    hint: str | None = None
+    available_tags: list[str] = field(default_factory=list)
+    tags_for: str | None = None  # "onnxruntime v1.31.0": whose wheels `available_tags` are
+
+
+@dataclass
 class ProbeResult:
     ok: bool
     stdout: str
     stderr: str
     resolved_packages: list[str] = field(default_factory=list)
     failing_package: str | None = None
+    detail: FailureDetail | None = None
 
 
 class _Backend(ABC):
@@ -80,9 +102,12 @@ class _UvBackend(_Backend):
     # therefore tolerates a newline + indentation wherever a space appears.
     # Wordings captured from real runs; see tests/test_runner_errors.py.
     _NO_VERSION_RE = re.compile(r"no\s+version\s+of\s+([A-Za-z0-9_.\-]+)")
-    _UNSATISFIABLE_RE = re.compile(
-        r"because\s+you\s+require\s+([A-Za-z0-9_.\-]+)[><=!,\s]", re.IGNORECASE,
-    )
+    # "you require X" names a DIRECT requirement — the only kind probe_all()
+    # can drop. Matches both "Because you require X" and the continuation form
+    # "...depends on Y and you require X" / "And because you require X".
+    # Case-sensitive on purpose: uv's hint line starts "You require CPython
+    # 3.15", which must not be read as a requirement named "CPython".
+    _YOU_REQUIRE_RE = re.compile(r"\byou\s+require\s+([A-Za-z0-9_.\-]+)[><=!~,;@\[\s]")
     # "Because <pkg> was not found in the package registry" — a name that was
     # never published (typo, private package, renamed project). Previously
     # unmatched, so failing_package came back None and probe_all() stopped
@@ -90,7 +115,26 @@ class _UvBackend(_Backend):
     _NOT_FOUND_RE = re.compile(
         r"[Bb]ecause\s+([A-Za-z0-9_.\-]+)\s+was\s+not\s+found\s+in\s+the\s+package\s+registry",
     )
-    _ABI_MISMATCH_RE = re.compile(r"([A-Za-z0-9_.\-]+) \(v[^)]+\) has no wheels")
+    # The root cause of an ABI/platform wheel gap. Three wordings seen so far:
+    #   "Because onnxruntime>=1.17.0 has no wheels with a matching Python ABI tag (e.g., `cp315`)"
+    #   "Because all versions of torch have no wheels with a matching Python ABI tag (e.g., `cp315`)"
+    #   "Because onnxruntime (v1.17.0) has no wheels with a matching Python ABI tag"
+    # The optional specifier (">=0.6.1,<=0.6.3") sits between name and verb.
+    _NO_WHEELS_RE = re.compile(
+        r"[Bb]ecause\s+(?:all\s+versions\s+of\s+)?(?P<name>[A-Za-z0-9_.\-]+)"
+        r"(?:\s*\(v[^)]+\)|[<>=!~][^\s,]*(?:,\s*[<>=!~][^\s,]*)*)?"
+        r"\s+(?:has|have)\s+no\s+wheels\s+with\s+a\s+matching\s+"
+        r"(?P<kind>[A-Za-z]+(?:\s+[A-Za-z]+)?)\s+tag"
+        r"(?:\s+\(e\.g\.,\s+`(?P<tag>[^`]+)`\))?",
+    )
+    # uv's closing hint, e.g.
+    #   hint: You require CPython 3.15 (`cp315`), but we only found wheels for
+    #   `onnxruntime` (v1.31.0) with the following Python ABI tags: `cp311`, ...
+    _HINT_RE = re.compile(r"(?m)^[ \t]*hint:[ \t]*(?P<text>.*(?:\n(?![ \t]*\n)[ \t]+\S.*)*)")
+    _HINT_TAGS_RE = re.compile(
+        r"found\s+wheels\s+for\s+`(?P<name>[^`]+)`(?:\s+\(v(?P<version>[^)]+)\))?"
+        r"\s+with\s+the\s+following\s+(?P<kind>[A-Za-z ]+?)\s+tags:\s*(?P<tags>[^\n]*)",
+    )
 
     def create_venv(self, venv_path: Path, python_version: str) -> subprocess.CompletedProcess:
         return _run(["uv", "venv", str(venv_path), "--python", python_version])
@@ -112,26 +156,72 @@ class _UvBackend(_Backend):
                 for line in proc.stderr.splitlines()
                 if line.strip().startswith("+")
             ]
-        failing = None if ok else self._extract_failing_package(proc.stderr)
+        detail = None if ok else self._extract_detail(proc.stderr)
+        failing = detail.candidates[0] if detail and detail.candidates else None
         return ProbeResult(ok=ok, stdout=proc.stdout, stderr=proc.stderr,
-                            resolved_packages=resolved, failing_package=failing)
+                            resolved_packages=resolved, failing_package=failing,
+                            detail=detail)
 
     def _extract_failing_package(self, stderr: str) -> str | None:
-        # Order matters: the specific diagnoses come first. _UNSATISFIABLE_RE
-        # matches the generic "you require <pkg>" tail that uv appends to
-        # nearly every message, so it must be the last resort — otherwise a
-        # "not found in the registry" error would be attributed by the tail
-        # rather than by the sentence that actually names the cause.
-        for pattern in (
-            self._ABI_MISMATCH_RE,
-            self._NOT_FOUND_RE,
-            self._NO_VERSION_RE,
-            self._UNSATISFIABLE_RE,
-        ):
-            m = pattern.search(stderr)
+        detail = self._extract_detail(stderr)
+        return detail.candidates[0] if detail.candidates else None
+
+    def _extract_detail(self, stderr: str) -> FailureDetail:
+        """Diagnose one failed resolve: what to drop, and what really blocks it.
+
+        Candidate order: direct requirements ("you require X") first, then the
+        package a specific diagnosis names. The old order (specific first)
+        attributed a transitive failure to a package that is not in the user's
+        requirement list; dropping it changed nothing and the retry loop
+        stopped with `<unknown>` (botorch, torchdiffeq on Python 3.15).
+        """
+        # The hint block restates the requirement in prose; keep it out of the
+        # sentence-level searches and parse it separately.
+        hint_match = self._HINT_RE.search(stderr)
+        body = stderr[:hint_match.start()] if hint_match else stderr
+
+        candidates: list[str] = []
+
+        def add(name: str) -> None:
+            if name not in candidates:
+                candidates.append(name)
+
+        for m in self._YOU_REQUIRE_RE.finditer(body):
+            add(m.group(1))
+
+        detail = FailureDetail()
+        wheels = self._NO_WHEELS_RE.search(body)
+        if wheels:
+            detail.root_package = wheels.group("name")
+            kind = " ".join(wheels.group("kind").split())
+            tag = wheels.group("tag")
+            if kind.lower() == "python abi" and tag:
+                detail.root_reason = f"no {tag} wheel"
+            else:
+                detail.root_reason = f"no wheels with a matching {kind} tag" + (
+                    f" ({tag})" if tag else "")
+            add(detail.root_package)
+        for pattern in (self._NOT_FOUND_RE, self._NO_VERSION_RE):
+            m = pattern.search(body)
             if m:
-                return m.group(1)
-        return None
+                if detail.root_package is None:
+                    detail.root_package = m.group(1)
+                    detail.root_reason = (
+                        "not found in the package registry"
+                        if pattern is self._NOT_FOUND_RE else "no matching version")
+                add(m.group(1))
+
+        if hint_match:
+            text = " ".join(hint_match.group("text").split())
+            detail.hint = text
+            tags = self._HINT_TAGS_RE.search(text)
+            if tags:
+                detail.available_tags = re.findall(r"`([^`]+)`", tags.group("tags"))
+                detail.tags_for = tags.group("name") + (
+                    f" v{tags.group('version')}" if tags.group("version") else "")
+
+        detail.candidates = candidates
+        return detail
 
 
 class _PipBackend(_Backend):
@@ -207,6 +297,12 @@ def _select_backend() -> _Backend:
 
 
 _REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)")
+_NORMALIZE_RE = re.compile(r"[-_.]+")
+
+
+def normalize_name(name: str) -> str:
+    """PEP 503 normalized distribution name ("Ruamel.YAML" -> "ruamel-yaml")."""
+    return _NORMALIZE_RE.sub("-", name.strip().lower())
 
 
 def _requirement_name(spec: str) -> str:
@@ -219,12 +315,12 @@ def _requirement_name(spec: str) -> str:
     them, neither probed nor reported. Names are compared whole instead.
     """
     m = _REQ_NAME_RE.match(spec)
-    return (m.group(1) if m else spec).strip().lower().replace("_", "-")
+    return normalize_name(m.group(1) if m else spec)
 
 
 def _drops(spec: str, package: str) -> bool:
     """True when `spec` requests `package` (PEP 503 normalized name match)."""
-    return _requirement_name(spec) == package.strip().lower().replace("_", "-")
+    return _requirement_name(spec) == normalize_name(package)
 
 
 def probe_once(requirements: list[str], python_version: str = "3.11",
@@ -263,8 +359,11 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
     """Repeatedly probe, dropping each failing package, to surface every failure.
 
     Returns {"ok": bool, "backend": str, "params": ResolvedParams,
-    "failures": [{"package": str, "stderr": str}], "resolved": [str],
-    "truncated": bool}.
+    "failures": [{"package": str, "stderr": str, "root_package"?: str,
+    "root_reason"?: str, "hint"?: str, "available_tags"?: [str],
+    "tags_for"?: str}],
+    "resolved": [str], "truncated": bool}. `root_package` is the package
+    uv blames when that differs from the requirement that had to be dropped.
 
     `truncated` is True when `max_rounds` was exhausted with requirements left
     unprobed — the failure list is then a lower bound, not the whole story.
@@ -291,13 +390,29 @@ def probe_all(requirements: list[str], python_version: str = "3.11", max_rounds:
                      "truncated": False}
 
         combined_output = "\n".join(s for s in (result.stderr, result.stdout) if s)
-        pkg = result.failing_package
+        detail = result.detail
+        # Drop a name the user actually asked for. The name uv blames can be
+        # transitive (markitdown -> magika -> onnxruntime); dropping that
+        # changes nothing, so take the first candidate present in `remaining`.
+        candidates = list(detail.candidates) if detail else (
+            [result.failing_package] if result.failing_package else [])
+        pkg = next((c for c in candidates
+                    if any(_drops(r, c) for r in remaining)), None)
+        failure = {"package": pkg or (candidates[0] if candidates else "<unknown>"),
+                   "stderr": combined_output}
+        if detail is not None and detail.root_package:
+            failure["root_package"] = detail.root_package
+            failure["root_reason"] = detail.root_reason
+        if detail is not None and detail.hint:
+            failure["hint"] = detail.hint
+            failure["available_tags"] = detail.available_tags
+            failure["tags_for"] = detail.tags_for
         if pkg is None or pkg in seen_failing:
-            failures.append({"package": pkg or "<unknown>", "stderr": combined_output})
+            failures.append(failure)
             break
 
         seen_failing.add(pkg)
-        failures.append({"package": pkg, "stderr": combined_output})
+        failures.append(failure)
         remaining = [r for r in remaining if not _drops(r, pkg)]
     else:
         # The loop ran out of rounds rather than resolving. Anything still in

@@ -12,8 +12,22 @@ from compat_check.cache import cached_probe_all
 from compat_check.fetcher import FetchError, fetch_requirements_detailed
 from compat_check.params import ParamError, validate_python_version
 from compat_check.render import render_tree
-from compat_check.runner import probe_all
+from compat_check.runner import normalize_name, probe_all
 from compat_check.tree import build_tree
+
+
+def _describe_blocker(failure: dict) -> str:
+    """" (blocked by onnxruntime: no cp315 wheel)" when uv names a root cause.
+
+    The dropped requirement and the package that really blocks it differ for
+    every transitive failure (markitdown -> magika -> onnxruntime).
+    """
+    root, reason = failure.get("root_package"), failure.get("root_reason")
+    if not root:
+        return ""
+    if normalize_name(root) == normalize_name(failure["package"]):
+        return f" ({reason})"
+    return f" (blocked by {root}: {reason})"
 
 
 def _print_report(source: str, requirements: list[str], result: dict,
@@ -58,7 +72,13 @@ def _print_report(source: str, requirements: list[str], result: dict,
     else:
         print(f"PROBLEMS FOUND — {len(result['failures'])} package(s) cannot be resolved:")
     for f in result["failures"]:
-        print(f"\n  [{f['package']}]")
+        print(f"\n  [{f['package']}]{_describe_blocker(f)}")
+        tags = f.get("available_tags")
+        if tags:
+            # uv's own closing hint, distilled: which interpreters the blocking
+            # package does ship wheels for. Raw wording stays in the evidence.
+            print(f"    wheels for {f.get('tags_for') or 'it'} exist only for: "
+                  f"{', '.join(tags)}")
         # Indent the raw resolver output so it reads as evidence, not noise.
         for line in f["stderr"].strip().splitlines():
             print(f"    {line}")

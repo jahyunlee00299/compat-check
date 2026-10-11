@@ -143,6 +143,36 @@ def test_no_constraints_means_no_constraint_line():
     assert "constraints applied" not in out
 
 
+def test_transitive_wheel_failure_names_the_root_cause_and_available_tags():
+    """markitdown fails because onnxruntime has no cp315 wheel; say so."""
+    failure = {"package": "markitdown", "stderr": "raw uv text",
+               "root_package": "onnxruntime", "root_reason": "no cp315 wheel",
+               "hint": "You require CPython 3.15", "tags_for": "onnxruntime v1.31.0",
+               "available_tags": ["cp311", "cp312", "cp314"]}
+    with mock.patch("compat_check.cli.fetch_requirements_detailed",
+                     return_value=FetchResult(requirements=["markitdown>=0.1"])), \
+         mock.patch("compat_check.cli.cached_probe_all",
+                     return_value={"ok": False, "backend": "uv", "failures": [failure],
+                                   "resolved": [], "cache_hit": False, "params": None}):
+        rc, out, err = _run(["fake-src"])
+    assert rc == 1
+    assert "[markitdown] (blocked by onnxruntime: no cp315 wheel)" in out, out
+    assert "wheels for onnxruntime v1.31.0 exist only for: cp311, cp312, cp314" in out, out
+
+
+def test_direct_wheel_failure_does_not_say_blocked_by_itself():
+    failure = {"package": "torch", "stderr": "raw", "root_package": "torch",
+               "root_reason": "no cp315 wheel"}
+    with mock.patch("compat_check.cli.fetch_requirements_detailed",
+                     return_value=FetchResult(requirements=["torch"])), \
+         mock.patch("compat_check.cli.cached_probe_all",
+                     return_value={"ok": False, "backend": "uv", "failures": [failure],
+                                   "resolved": [], "cache_hit": False, "params": None}):
+        rc, out, err = _run(["fake-src"])
+    assert "[torch] (no cp315 wheel)" in out, out
+    assert "blocked by" not in out
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
