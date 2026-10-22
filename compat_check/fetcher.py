@@ -422,18 +422,42 @@ def _fetch_from_github(ref: GitHubRef) -> FetchResult:
     )
 
 
-def _fetch_from_pypi(package_name: str) -> FetchResult:
-    url = f"https://pypi.org/pypi/{package_name}/json"
+# "name==1.2.3" — an exact pin, the form people paste from a lock file or CI script.
+_PYPI_PIN = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([A-Za-z0-9][A-Za-z0-9._+!-]*)\s*$")
+# any other version operator: rejected with a pointer to the supported form, never sent to PyPI
+# as a package name (that produced "PyPI package not found: thermosteam>=0.53").
+_PYPI_OTHER_SPEC = re.compile(r"[<>=!~;\[@ ]")
+
+
+def _fetch_from_pypi(source: str) -> FetchResult:
+    pin = _PYPI_PIN.match(source)
+    if pin is None and _PYPI_OTHER_SPEC.search(source.strip()):
+        raise FetchError(
+            f"{source!r}: only a bare name ('pkg') or an exact pin ('pkg==1.2.3') is supported "
+            f"for PyPI sources")
+    if pin is None:
+        package_name, version = source.strip(), None
+        url = f"https://pypi.org/pypi/{package_name}/json"
+    else:
+        package_name, version = pin.groups()
+        url = f"https://pypi.org/pypi/{package_name}/{version}/json"
     text = _http_get(url)
     if text is None:
-        raise FetchError(f"PyPI package not found: {package_name}")
+        if version is None or _http_get(f"https://pypi.org/pypi/{package_name}/json") is None:
+            raise FetchError(f"PyPI package not found: {package_name}")
+        raise FetchError(f"PyPI package {package_name} has no release {version}")
     data = json.loads(text)
     requires_dist = data.get("info", {}).get("requires_dist") or []
     # drop extras-only markers (e.g. 'foo; extra == "dev"') — base install only.
     base = [r for r in requires_dist if "extra ==" not in r]
+    label = package_name if version is None else f"{package_name}=={version}"
+    if version is not None:
+        # the pin itself goes first: a release with no wheel/sdist for this Python or platform is
+        #   exactly the failure a pinned check exists to catch, and its deps alone cannot show it.
+        base = [label] + base
     if not base:
-        raise FetchError(f"PyPI package {package_name} declares no base requires_dist")
-    return FetchResult(requirements=base, source_file="PyPI requires_dist")
+        raise FetchError(f"PyPI package {label} declares no base requires_dist")
+    return FetchResult(requirements=base, source_file=f"PyPI requires_dist ({label})")
 
 
 def fetch_requirements_detailed(source: str) -> FetchResult:

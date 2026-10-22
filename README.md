@@ -94,6 +94,11 @@ uv tool install git+https://github.com/jahyunlee00299/compat-check
 compat-check <github-url-or-pypi-package-name> [--python 3.11] [--no-cache] [--tree]
 ```
 
+A PyPI source is a bare name (`requests`, the latest release) or an exact pin
+(`thermosteam==0.53.5`, that release's own requirements plus the pin itself, so
+a release with no wheel for this Python shows up too). Other operators (`>=`,
+`~=`, extras) are rejected with a message rather than looked up as a name.
+
 The GitHub source accepts the forms people actually paste:
 
 ```

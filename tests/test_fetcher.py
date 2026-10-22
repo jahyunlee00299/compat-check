@@ -63,6 +63,30 @@ def test_fetch_requirements_nonexistent_pypi_package_raises():
         pass
 
 
+
+def test_fetch_requirements_from_pypi_exact_pin_reads_that_release():
+    reqs = fetch_requirements("thermosteam==0.53.5")
+    assert reqs[0] == "thermosteam==0.53.5"
+    names = " ".join(reqs[1:]).lower()
+    assert "numpy" in names and "thermo" in names
+
+
+def test_fetch_requirements_pin_to_missing_release_says_so():
+    try:
+        fetch_requirements("requests==0.0.0.999")
+        assert False, "expected FetchError"
+    except FetchError as e:
+        assert "has no release 0.0.0.999" in str(e)
+
+
+def test_fetch_requirements_other_specifiers_are_rejected_clearly():
+    for spec in ("requests>=2", "requests~=2.0", "requests[socks]"):
+        try:
+            fetch_requirements(spec)
+            assert False, f"expected FetchError for {spec}"
+        except FetchError as e:
+            assert "exact pin" in str(e), spec
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
