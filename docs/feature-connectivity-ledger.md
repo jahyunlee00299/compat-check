@@ -221,7 +221,7 @@
 - **Trigger**: user explicitly required GitHub-account-only identity before publishing — no real
   name in LICENSE or commit authorship
 - **Change**:
-  - `LICENSE` copyright line: `Ja Hyun Lee` → `jahyunlee00299` (GitHub account name)
+  - `LICENSE` copyright line: owner's legal name → `jahyunlee00299` (GitHub account name)
   - All 7 existing commits rewritten via `git filter-branch --env-filter` to author/committer
     `jahyunlee00299 <158720608+jahyunlee00299@users.noreply.github.com>` (GitHub's standard
     noreply address format, id+login — computed from `gh api user`, not guessed)
@@ -232,7 +232,7 @@
 - **Evidence (Prove)**: `gh api repos/jahyunlee00299/compat-check/commits` — GitHub's own API
   confirms every commit shows only the noreply identity, nothing else
 - **Refutation (Refute)** — real signals, not just "the rewrite command exited 0":
-  - `grep -rniE "korea\.ac\.kr|egemen7|C:\\\\Users\\\\Jahyun|/c/Users/Jahyun|Ja Hyun Lee"` across
+  - `grep -rniE "<affiliation mail domain>|<collaborator handle>|<owner Windows home path>|<owner legal name>"` across
     the full working tree (excluding `.git/`) → zero matches, before push
   - **caught mid-flight**: a follow-up commit (README owner-placeholder fix) silently reverted to
     the real name/school-email identity, because the repo-local `git commit` picked up the global
